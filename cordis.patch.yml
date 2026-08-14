@@ -1,0 +1,19 @@
+# dsh-matrix bundle layer: inserts the Matrix bridge row into the composition.
+# Patch rows win per-row by id; the whole `config` value is replaced, not merged.
+- insert:
+    - id: matrix
+      name: dsh-matrix
+      config:
+        homeserverUrl: 'https://matrix-client.matrix.org'
+        userId: '@dsh-bot:matrix.org'
+        # accessToken 留空时回退到环境变量 DSH_MATRIX_TOKEN（两者都没有则插件加载失败）
+        accessToken: ''
+        # 白名单为空且 allowAllUsers=false 时拒绝所有入站消息（fail closed）
+        allowedUserIds: []
+        allowAllUsers: false
+        provider: 'deepseek-official'
+        model: 'deepseek-v4-flash'
+        chunkMaxChars: 4000
+        mergeTimeoutSecs: 5
+        approvalTimeoutSecs: 300
+        stateDir: '.dsh-matrix'
