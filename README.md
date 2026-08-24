@@ -4,20 +4,25 @@ DeepSeek Harness（dsh）的 Matrix 通信插件：把 Matrix 房间桥接到 ha
 
 ```
 src/
-├── index.ts     # 插件入口（name/inject/apply/Config），无 default export
-├── bridge.ts    # 桥接层：入站注入 / 出站投递 / 审批应答 / 命令 / 合并窗口，与具体 IM 无关
-├── matrix.ts    # 通道层：零依赖 Matrix client-server API 客户端（fetch + /sync 长轮询）
-├── config.ts    # Schemastery 配置 schema
-├── store.ts     # 文件落盘状态：房间↔会话映射、事件去重环、sync token
-└── format.ts    # 保守 markdown 子集 → Matrix HTML，收敛前缀长回复分段
+├── index.ts      # 插件入口（name/inject/apply/Config），无 default export
+├── bridge.ts     # 桥接层：多账号编排（AccountBridge）、入站路由（@提及/私聊）、审批、授权
+├── matrix.ts     # 通道层：零依赖 Matrix client-server API 客户端（fetch + /sync 长轮询）
+├── config.ts     # Schemastery 配置 schema（含数字分身 digitalTwins）
+├── store.ts      # 文件落盘状态：房间↔会话映射、事件去重环、sync token
+├── auth-store.ts # 记忆授权库：分身↔Owner、工具授权、红线判定
+└── format.ts     # 保守 markdown 子集 → Matrix HTML，收敛前缀长回复分段
 ```
 
 ## 能力
 
 - **Matrix → DSH**：白名单用户文本经合并窗口（`..` 继续 / `!!` 立即提交 / 裸文本进合并窗口）后，通过 `agent.followup` 注入对应房间的 agent 会话；`/bind <session-id>` 可切换到已有会话
 - **DSH → Matrix**：监听 `session/event`，把 `assistant/message` 的可见文本分段（前缀 `（i/n）` 参与长度收敛）后以 `org.matrix.custom.html` 发回；`turn/start` 显示 typing
-- **审批**：注册 `approval/request` answerer，把审批请求（工具名 + 原因）推送到房间，等白名单用户回复「批准 / 拒绝」（超时按 unavailable 处理）
-- **命令**：`/help` `/status` `/new` `/clear` `/bind <session-id>`
+- **多账号（数字分身）**：一个 harness 内可挂载主账号 + N 个分身（每个分身独立 Matrix 账号、独立 sync、独立会话空间）。消息路由：**@提及谁谁响应**；无提及时主账号兜底（旧行为）；纯审批词在多账号间协调归属
+- **三级授权**：
+  - **L1 记忆授权**：非红线工具此前被批准过 → 静默放行（`auth-store.json` 持久化）
+  - **L2 即时确认**：房间推送审批，分身账号**仅 Owner** 可应答，批准后写入记忆授权库
+  - **L3 红线强制**：命中 `redlineTools`（默认 `bash`/`pwsh`/`write`/`edit`）→ **每次都必须确认**，批准永不入库
+- **命令**：`/help` `/status` `/new` `/clear` `/bind <session-id>` `/auth list` `/auth revoke <tool>` `/auth revoke-all`
 - **可靠性**：事件 id 持久去重环、sync token 落盘重启续传、长回复 HTML 失败回退纯文本、sync 循环指数退避
 
 ## 为什么通道层不用现成 SDK
@@ -52,7 +57,7 @@ allowBuilds:
 |---|---|---|
 | `homeserverUrl` | 必填 | homeserver 的 client-server API base URL |
 | `accessToken` | `''` | bot access token；为空回退环境变量 `DSH_MATRIX_TOKEN`，两者都缺则插件加载失败 |
-| `userId` | 必填 | bot 的 Matrix 用户 id，如 `@dsh-bot:example.org` |
+| `userId` | 必填 | 主账号的 Matrix 用户 id（个人助手 / 主分身），如 `@ai-zhang:example.org` |
 | `allowedUserIds` | `[]` | 白名单；为空且 `allowAllUsers=false` 时拒绝所有人（fail closed） |
 | `allowAllUsers` | `false` | 允许任意用户（仅开发用） |
 | `provider` | `deepseek-official` | 每个房间 agent 的 LLM provider |
@@ -61,6 +66,26 @@ allowBuilds:
 | `mergeTimeoutSecs` | `5` | 裸文本合并窗口（秒） |
 | `approvalTimeoutSecs` | `300` | 审批推送后等待聊天答复的秒数 |
 | `stateDir` | `.dsh-matrix` | 状态目录（`state.json` 房间映射 + 去重 + sync token） |
+| `digitalTwinMode` | `false` | 启用数字分身模式（解析 `digitalTwins` 列表） |
+| `digitalTwins` | `[]` | 分身账号列表，见下方示例 |
+| `authStoreFile` | `auth-store.json` | 记忆授权库文件名（相对 `stateDir`） |
+| `redlineTools` | `['bash','pwsh','write','edit']` | 红线工具：即使有记忆授权也每次强制房间确认 |
+
+### 数字分身配置示例
+
+```yaml
+digitalTwinMode: true
+digitalTwins:
+  - userId: '@ai-zhang-pm:example.org'        # 分身账号（需预先注册并取得 access token）
+    tokenEnv: 'DSH_MATRIX_AI_ZHANG_PM_TOKEN'   # 从环境变量读 token（推荐）；或直接 accessToken
+    owner: '@zhang-san:example.org'            # 工作责任负责人（主人）：仅其可在房间应答审批
+    role: 'pm'                                 # 角色标签（展示用）
+    respondToAll: false                        # 默认仅 @提及/私聊 响应；true 则响应房间所有消息
+    provider: ''                               # 留空回退顶层 provider/model
+    model: ''
+```
+
+每个分身独立 sync 循环、独立状态文件（`<stateDir>/twins/<localpart>.json`）、独立 per-room agent 会话；审批按「分身×房间」维度记录记忆授权，Owner 变更不影响其他分身。分身访问控制：默认仅 Owner 本人（或 `allowAllUsers` / 白名单内用户）可驱动。
 
 ## 使用
 

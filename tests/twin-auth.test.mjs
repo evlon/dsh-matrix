@@ -1,11 +1,9 @@
 /**
- * dsh-matrix 端到端冒烟：用一个假 homeserver（fetch 接缝）验证
- * 入站合并注入、出站 assistant 投递、审批推送与聊天应答、命令、去重、状态落盘。
- *
- * 假 homeserver 按每个 Bearer token 维护独立事件队列 + waiter：
- * 真实 Matrix 房间中所有成员收到同样事件；多账号桥接场景互不覆盖。
- *
- * 跑法：npm run build 后 `node --test tests/bridge.test.mjs`
+ * dsh-matrix 多账号 + Owner 授权端到端测试
+ * - 主账号 + 一个分身账号（Owner 为 @owner:hs）
+ * - 审批：分身工具请求 → 房间推送 → Owner 回复「批准」→ 记忆授权写库
+ * - 命令：/auth list、/auth revoke <tool>（仅 Owner）；非 Owner 被拒
+ * - 路由：分身仅响应 @提及
  */
 
 import assert from 'node:assert/strict'
@@ -16,7 +14,9 @@ import test from 'node:test'
 import { MatrixBridge } from '../lib/bridge.js'
 
 const ROOM_ID = '!room:hs.example'
-const USER_ID = '@bot:hs.example'
+const MAIN_USER_ID = '@bot-main:hs.example'
+const TWIN_USER_ID = '@bot-twin:hs.example'
+const OWNER_ID = '@owner:hs.example'
 const SENDER = '@alice:hs.example'
 
 function fakeHomeserver() {
@@ -72,8 +72,8 @@ function fakeHomeserver() {
   }
 }
 
-function textEvent(eventId, body) {
-  return { type: 'm.room.message', sender: SENDER, event_id: eventId, content: { msgtype: 'm.text', body } }
+function textEvent(eventId, body, sender = SENDER) {
+  return { type: 'm.room.message', sender, event_id: eventId, content: { msgtype: 'm.text', body } }
 }
 
 function makeCtx() {
@@ -101,31 +101,33 @@ function makeCtx() {
           captured.agents.push(handle)
           return handle
         },
-        async resume() { throw new Error('session persistence is not configured') },
+        async resume() { throw new Error('no persistence') },
       },
     },
   }
 }
 
-async function waitFor(predicate, timeoutMs = 3000) {
+async function waitFor(predicate, label, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (predicate()) return
+    if (predicate()) { console.log('✓', label); return }
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
-  throw new Error('waitFor timed out')
+  console.log('✗ TIMEOUT:', label)
+  throw new Error('waitFor timed out: ' + label)
 }
 
-test('bridge end-to-end: merge, assistant delivery, approval, commands, dedup, state', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-test-'))
+test('multi-account + owner auth: twin approval, auth commands, routing', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-test-twin-'))
   try {
     const hs = fakeHomeserver()
     const { ctx, captured } = makeCtx()
+
     const bridge = new MatrixBridge(ctx, {
       homeserverUrl: 'https://hs.example',
-      accessToken: 'token',
-      userId: USER_ID,
-      allowedUserIds: [SENDER],
+      accessToken: 'main-token',
+      userId: MAIN_USER_ID,
+      allowedUserIds: [SENDER, OWNER_ID],
       allowAllUsers: false,
       provider: 'deepseek-official',
       model: 'deepseek-v4-flash',
@@ -135,53 +137,71 @@ test('bridge end-to-end: merge, assistant delivery, approval, commands, dedup, s
       stateDir: dir,
       fetchFn: hs.fetch,
       sleep: async () => {},
+      digitalTwinMode: true,
+      digitalTwins: [
+        {
+          userId: TWIN_USER_ID,
+          accessToken: 'twin-token',
+          tokenEnv: '',
+          owner: OWNER_ID,
+          role: 'twin',
+          respondToAll: false,
+          provider: 'deepseek-official',
+          model: 'deepseek-v4-flash',
+        },
+      ],
     })
 
+    // 双账号同步启动；deliver([]) 按账号数调用（每个账号各释放一次启动 sync）。
     const startPromise = bridge.start()
+    hs.deliver([])
     hs.deliver([])
     await startPromise
 
-    // 1) 合并窗口
-    hs.deliver([textEvent('$e1', '你好..'), textEvent('$e2', '世界!!')])
-    await waitFor(() => captured.messages.length === 1)
-    const merged = captured.messages[0]
-    assert.equal(merged.content[0].text, '你好\n世界')
-    assert.equal(merged.source.kind, 'plugin')
-    assert.equal(merged.source.plugin, 'dsh-matrix')
-    const agentId = captured.agents[0].agent.id
+    // 1) 主账号响应裸文本（旧行为）；用 !! 立即提交，避免 5s 合并窗口拖慢测试
+    hs.deliver([textEvent('$m1', '你好!!')])
+    await waitFor(() => captured.messages.length === 1, 'main responds')
+    assert.equal(captured.messages[0].content[0].text, '你好')
+    captured.messages.length = 0
 
-    // 2) 出站：markdown 子集 HTML
-    captured.sessionHandler({ id: agentId }, {
-      type: 'assistant/message',
-      data: { message: { content: [{ type: 'text', text: '**hi** `x`' }] } },
-    })
-    await waitFor(() => hs.sends.some((s) => s.kind === 'send' && s.body.formatted_body === '<b>hi</b> <code>x</code>'))
-    const assistant = hs.sends.find((s) => s.kind === 'send' && s.body.formatted_body !== undefined)
-    assert.equal(assistant.body.msgtype, 'm.text')
-    assert.equal(assistant.body.format, 'org.matrix.custom.html')
-    assert.equal(assistant.body.formatted_body, '<b>hi</b> <code>x</code>')
+    // 2) 分身收到 @提及 → 响应（主账号应让位，只有 twin 注入）
+    hs.deliver([textEvent('$t1', `@bot-twin:hs.example 你好!!`)])
+    await waitFor(() => captured.messages.length === 1, 'twin responds')
+    const twinMsg = captured.messages.find((m) => m.content[0].text.includes('你好'))
+    assert.ok(twinMsg, 'twin should have been the only responder')
+    captured.messages.length = 0
 
-    // 3) 去重
-    hs.deliver([textEvent('$e1', '你好..')])
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    assert.equal(captured.messages.length, 1)
-
-    // 4) 审批
-    const req = { agent: { id: agentId }, toolName: 'bash', reason: '跑命令', signal: undefined }
+    // 3) 分身工具请求 → 房间推送审批
+    const twinAgentId = captured.agents[1].agent.id
+    const req = { agent: { id: twinAgentId }, toolName: 'bash', reason: 'run cmd', signal: undefined }
     const outcomePromise = captured.approvalHandler(req, async () => 'unavailable')
-    await waitFor(() => hs.sends.some((s) => s.body.body !== undefined && s.body.body.includes('审批请求')))
-    hs.deliver([textEvent('$r1', '批准')])
+    await waitFor(() => hs.sends.some((s) => s.body.body?.includes('审批请求')), 'approval push')
+    const approval = hs.sends.find((s) => s.body.body?.includes('审批请求'))
+    assert.ok(approval.body.body.includes('仅 Owner @owner 可以应答'))
+
+    // 4) Owner 批准 → 记忆授权写库
+    hs.deliver([textEvent('$a1', '批准', OWNER_ID)])
     assert.equal(await outcomePromise, 'allowed-once')
 
-    // 5) /status
-    hs.deliver([textEvent('$c1', '/status')])
-    await waitFor(() => hs.sends.some((s) => s.body.body !== undefined && s.body.body.includes('当前会话')))
+    // 5) /auth list 显示记忆授权（必须 @提及 分身，主账号不截胡）
+    hs.deliver([textEvent('$l1', '@bot-twin:hs.example /auth list', OWNER_ID)])
+    await waitFor(() => hs.sends.some((s) => s.body.body?.includes('记忆授权')), 'auth list')
+    const list = hs.sends.find((s) => s.body.body?.includes('记忆授权'))
+    assert.ok(list.body.body.includes('bash'))
+
+    // 6) 非 Owner（SENDER）@提及分身尝试吊销 → 拒绝
+    hs.deliver([textEvent('$r1', '@bot-twin:hs.example /auth revoke bash', SENDER)])
+    await waitFor(() => hs.sends.some((s) => s.body.body?.includes('只有 Owner')), 'non-owner denied')
+
+    // 7) Owner 吊销
+    hs.deliver([textEvent('$r2', '@bot-twin:hs.example /auth revoke-all', OWNER_ID)])
+    await waitFor(() => hs.sends.some((s) => s.body.body?.includes('已吊销')), 'owner revoke-all')
 
     await bridge.stop()
-    const saved = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
-    assert.equal(saved.version, 1)
-    assert.equal(saved.roomSessions[ROOM_ID].sessionId, agentId)
-    assert.ok(typeof saved.syncToken === 'string' && saved.syncToken.startsWith('s'))
+
+    // 8) 记忆授权库落盘后已清空
+    const auth = JSON.parse(await readFile(join(dir, 'auth-store.json'), 'utf8'))
+    assert.equal(auth.records.length, 0)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

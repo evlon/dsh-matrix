@@ -1,8 +1,9 @@
 /**
- * Matrix→harness 桥接层：per-room agent 会话、入站消息注入、出站投递、
- * 审批推送与聊天应答、命令与合并窗口。只依赖 Channel 接口，与具体协议无关。
+ * Matrix→harness 桥接层：多账号支持（主账号 + N 个数字分身）、per-room & per-account
+ * agent 会话、入站消息注入（@提及路由 / 合并窗口）、出站投递、审批推送与聊天应答、
+ * Owner 授权记忆（L1 静默 / L2 房间确认 / L3 红线强制）。
  *
- * 在原版基础上新增：Owner 授权记忆（L1 记忆授权 / L2 房间确认 / L3 红线强制）。
+ * 每个矩阵账号一个 AccountBridge：独立 sync 循环、独立状态文件、独立会话绑定。
  *
  * @module dsh-matrix/bridge
  */
@@ -16,7 +17,7 @@ import type { TextBlock } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
-import type { Config } from './config.js'
+import type { Config, DigitalTwinAccount } from './config.js'
 import { chunkText, markdownToHtml } from './format.js'
 import { MatrixChannel } from './matrix.js'
 import type { Channel, InboundMessage } from './matrix.js'
@@ -32,9 +33,9 @@ const HELP_TEXT = [
   '/new — 开始一个全新会话',
   '/clear — 重置当前会话（同 /new）',
   '/bind <session-id> — 把本房间绑定到已有会话（需要 session persistence）',
-  '/auth list — 列出本房间的记忆授权',
-  '/auth revoke <tool> — 吊销某工具的记忆授权',
-  '/auth revoke-all — 吊销本房间全部记忆授权',
+  '/auth list — 列出本分身在本房间的记忆授权',
+  '/auth revoke <tool> — 吊销某工具的记忆授权（仅 Owner）',
+  '/auth revoke-all — 吊销本房间全部记忆授权（仅 Owner）',
   '',
   '消息合并：以 `..` 结尾表示还有后续，以 `!!` 结尾表示立即提交，裸文本进入合并窗口。',
 ].join('\n')
@@ -61,159 +62,172 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-export interface MatrixBridgeOptions extends Config {
-  readonly accessToken: string
-  /** 测试接缝：替换通道层的 fetch 与 sleep。 */
-  readonly fetchFn?: typeof fetch
-  readonly sleep?: (ms: number) => Promise<void>
+function localpartOf(mxid: string): string {
+  const at = mxid.indexOf(':')
+  return at > 0 ? mxid.slice(1, at) : mxid.slice(1)
 }
 
-export class MatrixBridge {
+/**
+ * 单个 Matrix 账号的桥接单元：独立 sync 循环、独立状态文件、独立会话绑定。
+ */
+export class AccountBridge {
+  readonly userId: string
+  readonly isMain: boolean
+  readonly owner?: string
+  private readonly respondToAll: boolean
+  private readonly agentOptions: AgentOptions
+
   private readonly ctx: Context
-  private readonly config: MatrixBridgeOptions
+  private readonly config: Config
   private readonly state: BridgeState
   private readonly authStore: AuthStore
   private readonly channel: Channel
+  private readonly allAccountIds: readonly string[]
+  /** 共享的「房间内有 pending 审批」集合（MatrixBridge 传入，多账号协调审批应答）。 */
+  private readonly pendingRooms: Set<string>
+
   private readonly roomAgents = new Map<string, AgentHandle>()
   private readonly mergeBuffers = new Map<string, MergeBuffer>()
   private readonly pendingApprovals = new Map<string, PendingApproval[]>()
-  private disposeEvents: (() => void) | undefined
-  private disposeApproval: (() => void) | undefined
-  private stopped = false
 
-  constructor(ctx: Context, config: MatrixBridgeOptions) {
+  constructor(
+    ctx: Context,
+    config: Config,
+    state: BridgeState,
+    authStore: AuthStore,
+    account: DigitalTwinAccount,
+    allAccountIds: readonly string[],
+    pendingRooms: Set<string>,
+    fetchFn?: typeof fetch,
+    sleep?: (ms: number) => Promise<void>,
+  ) {
     this.ctx = ctx
     this.config = config
-    this.state = new BridgeState(join(config.stateDir, 'state.json'))
-    this.authStore = new AuthStore(config.stateDir, config.authStoreFile ?? 'auth-store.json')
+    this.state = state
+    this.authStore = authStore
+    this.allAccountIds = allAccountIds
+    this.pendingRooms = pendingRooms
+
+    this.userId = account.userId
+    this.isMain = account.userId === config.userId
+    this.owner = account.owner !== '' ? account.owner : undefined
+    // 主账号默认响应全部消息（个人助手模式）；分身默认仅 @提及 或私聊。
+    this.respondToAll = account.respondToAll || this.isMain
+    this.agentOptions = {
+      provider: account.provider !== '' ? account.provider : config.provider,
+      model: account.model !== '' ? account.model : config.model,
+    }
+
     this.channel = new MatrixChannel({
       homeserverUrl: config.homeserverUrl,
-      accessToken: config.accessToken,
-      userId: config.userId,
+      accessToken: account.accessToken,
+      userId: this.userId,
       state: this.state,
       onMessage: (message) => {
         void this.handleMessage(message)
       },
       isAllowed: (sender) => this.authorized(sender),
       logger: ctx.logger,
-      ...(config.fetchFn === undefined ? {} : { fetchFn: config.fetchFn }),
-      ...(config.sleep === undefined ? {} : { sleep: config.sleep }),
+      ...(fetchFn === undefined ? {} : { fetchFn }),
+      ...(sleep === undefined ? {} : { sleep }),
     })
   }
 
+  /** ---------- 生命周期 ---------- */
+
   async start(): Promise<void> {
-    if (this.disposeEvents !== undefined) return
     await this.state.load()
-    await this.authStore.load()
-    this.disposeEvents = this.ctx.on('session/event', (session, event) => {
-      this.handleSessionEvent(session, event)
-    })
-    this.ctx.inject(['approval'], (approvalCtx) => {
-      this.disposeApproval = approvalCtx.on('approval/request', async (req, next) => {
-        const roomId = this.roomForSession(req.agent.id)
-        if (roomId === undefined) return next()
-        return this.handleApproval(roomId, req)
-      })
-    })
     await this.connectWithRetry()
   }
 
   async stop(): Promise<void> {
-    this.stopped = true
-    if (this.disposeEvents !== undefined) {
-      this.disposeEvents()
-      this.disposeEvents = undefined
-    }
-    this.disposeApproval?.()
-    this.disposeApproval = undefined
-    for (const roomId of this.roomAgents.keys()) {
-      const buffer = this.mergeBuffers.get(roomId)
-      if (buffer !== undefined) {
-        if (buffer.timer !== undefined) clearTimeout(buffer.timer)
-        this.mergeBuffers.delete(roomId)
-      }
-    }
     const handles = [...this.roomAgents.values()]
     this.roomAgents.clear()
     await Promise.allSettled(handles.map((handle) => handle.dispose()))
     await this.channel.stop()
     await this.state.dispose()
-    await this.authStore.save().catch(() => {})
   }
 
   private async connectWithRetry(): Promise<void> {
     let attempt = 0
     for (;;) {
-      if (this.stopped) return
       try {
         await this.channel.start()
-        this.ctx.logger.info('[dsh-matrix] connected as %s', this.config.userId)
+        this.ctx.logger.info(
+          '[dsh-matrix] %s connected as %s%s',
+          this.isMain ? 'main' : 'twin',
+          this.userId,
+          this.owner !== undefined ? ` (owner: ${this.owner})` : '',
+        )
         return
       } catch (error) {
         attempt += 1
-        this.ctx.logger.warn('[dsh-matrix] sync failed (attempt %d): %s', attempt, messageOf(error))
+        this.ctx.logger.warn('[dsh-matrix] sync failed for %s (attempt %d): %s', this.userId, attempt, messageOf(error))
         await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * attempt, 10000)))
       }
     }
   }
 
+  /** ---------- 身份与权限 ---------- */
+
   private authorized(sender: string): boolean {
     if (this.config.allowAllUsers) return true
+    if (!this.isMain && sender === this.owner) return true
     return this.config.allowedUserIds.includes(sender)
   }
 
-  private agentOptions(): AgentOptions {
-    return { provider: this.config.provider, model: this.config.model }
+  /**
+   * 消息路由（多账号协作语义）：
+   * 1. 若消息 @提及 了任一已知账号（主账号或分身），则只有被 @提及 的账号响应；
+   * 2. 无任何 @提及 时：主账号响应全部（旧行为）；分身仅响应 respondToAll 或私聊（≤2 人房间）。
+   * 命令同样遵循该规则；审批应答不受此门控限制（在 handleMessage 中先行处理）。
+   */
+  private async shouldRespond(message: InboundMessage): Promise<boolean> {
+    const lower = message.text.toLowerCase()
+    const mentioned = this.allAccountIds.filter((id) =>
+      lower.includes(`@${localpartOf(id).toLowerCase()}`) || lower.includes(id.toLowerCase()),
+    )
+    if (mentioned.length > 0) {
+      return mentioned.includes(this.userId)
+    }
+    if (this.respondToAll) return true
+    if (this.channel.isDirectRoom && await this.channel.isDirectRoom(message.roomId)) return true
+    return false
   }
 
-  private roomForSession(sessionId: string): string | undefined {
-    return this.state.sessionRoom(sessionId)
-  }
-
-  /** 红线工具判定：即使有记忆授权也必须每次房间确认。 */
   private isRedline(toolName: string): boolean {
     return (this.config.redlineTools ?? []).includes(toolName)
   }
 
-  /**
-   * 审批决策入口：
-   * - L3 红线：永远进房间确认，批准不入库；
-   * - L1 记忆授权：静默放行；
-   * - L2 其余：进房间确认；批准后写入记忆授权。
-   */
-  private handleApproval(roomId: string, request: ApprovalRequest): Promise<ApprovalOutcome> {
-    const grantable = !this.isRedline(request.toolName)
-    if (grantable && this.authStore.isStandingAuthorized(this.config.userId, roomId, request.toolName, this.config.redlineTools ?? [])) {
-      this.ctx.logger.info('[dsh-matrix] standing auth for `%s` in %s', request.toolName, roomId)
-      return Promise.resolve('allowed-once')
-    }
-    return this.askRoom(roomId, request, grantable)
+  /** ---------- 会话绑定 ---------- */
+
+  roomForSession(sessionId: string): string | undefined {
+    return this.state.sessionRoom(sessionId)
   }
 
-  /**
-   * 房间的当前 agent：内存缓存 → 持久绑定 resume → 新建。
-   */
   private async getRoomAgent(roomId: string): Promise<Agent> {
     const existing = this.roomAgents.get(roomId)
     if (existing !== undefined) return existing.agent
+
     const binding = this.state.roomSession(roomId)
     if (binding !== undefined) {
       try {
         const handle = await this.ctx.agents.resume({
           resumeSessionId: SessionId(binding),
-          agentOptions: this.agentOptions(),
+          agentOptions: this.agentOptions,
         })
         this.roomAgents.set(roomId, handle)
         return handle.agent
       } catch (error) {
-        this.ctx.logger.warn('[dsh-matrix] resume %s failed (%s); starting a fresh session', binding, messageOf(error))
+        this.ctx.logger.warn('[dsh-matrix] resume %s failed (%s); starting fresh', binding, messageOf(error))
       }
     }
-    const sessionId = SessionId(`matrix-${randomUUID()}`)
+
+    const sessionId = SessionId(`matrix-${localpartOf(this.userId)}-${randomUUID()}`)
     const handle = await this.ctx.agents.create({
       sessionId,
       meta: { cwd: process.cwd() },
-      agentOptions: this.agentOptions(),
+      agentOptions: this.agentOptions,
     })
     this.roomAgents.set(roomId, handle)
     this.state.setRoomSession(roomId, handle.agent.id)
@@ -235,16 +249,29 @@ export class MatrixBridge {
     }
   }
 
+  /** ---------- 入站消息 ---------- */
+
   private async handleMessage(message: InboundMessage): Promise<void> {
     try {
       const text = message.text.trim()
       if (text === '') return
-      // 优先应答审批：白名单校验已在通道层完成。
-      const first = this.pendingApprovals.get(message.roomId)?.[0]
-      if (first !== undefined) {
-        if (APPROVE_RE.test(text)) {
+
+      // 剥离 @提及 前缀后再判定命令/审批词（如 '@ai-dev /auth list'）。
+      const stripped = text.replace(/@[a-z0-9._-]+(?::[a-z0-9._-]+)?/gi, '').trim()
+
+      // 审批应答最优先（不受 @提及/私聊 路由门控限制）：
+      // 非主账号时仅 Owner 可应答；非 Owner 的应答直接忽略。
+      const queue = this.pendingApprovals.get(message.roomId)
+      const first = queue?.[0]
+      const isApprovalWord = APPROVE_RE.test(stripped) || DENY_RE.test(stripped)
+      if (first !== undefined && isApprovalWord) {
+        if (!this.isMain && message.sender !== this.owner) {
+          this.ctx.logger.warn('[dsh-matrix] approval reply from %s ignored (only %s may answer)', message.sender, this.owner)
+          return
+        }
+        if (APPROVE_RE.test(stripped)) {
           if (first.grantOnApprove) {
-            this.authStore.grant(this.config.userId, this.config.userId, message.roomId, first.request.toolName)
+            this.authStore.grant(this.userId, this.owner ?? this.userId, message.roomId, first.request.toolName)
             void this.authStore.save().catch((error: unknown) => {
               this.ctx.logger.error('[dsh-matrix] auth save failed: %s', messageOf(error))
             })
@@ -252,16 +279,23 @@ export class MatrixBridge {
           first.settle('allowed-once')
           return
         }
-        if (DENY_RE.test(text)) {
-          first.settle('rejected')
-          return
-        }
-      }
-      if (text.startsWith('/')) {
-        this.flushMerge(message.roomId)
-        await this.handleCommand(message.roomId, text)
+        first.settle('rejected')
         return
       }
+      // 多账号协调：房间里有别的账号的 pending 审批时，纯审批词归那个账号，
+      // 本账号不把它当普通消息注入会话。
+      if (isApprovalWord && this.pendingRooms.has(message.roomId)) {
+        return
+      }
+
+      if (!(await this.shouldRespond(message))) return
+
+      if (stripped.startsWith('/')) {
+        this.flushMerge(message.roomId)
+        await this.handleCommand(message.roomId, message.sender, stripped)
+        return
+      }
+
       // 合并窗口：'..' 继续、'!!' 立即提交、裸文本等待 mergeTimeoutSecs。
       let rest = text
       let flush = false
@@ -303,7 +337,9 @@ export class MatrixBridge {
     }))
   }
 
-  private async handleCommand(roomId: string, raw: string): Promise<void> {
+  /** ---------- 命令 ---------- */
+
+  private async handleCommand(roomId: string, sender: string, raw: string): Promise<void> {
     const [command, ...rest] = raw.split(/\s+/)
     const arg = rest.join(' ').trim()
     const reply = (text: string) => this.safeSend(roomId, text, markdownToHtml(text))
@@ -320,8 +356,9 @@ export class MatrixBridge {
         break
       case '/status': {
         const handle = this.roomAgents.get(roomId)
-        if (handle === undefined) await reply('本房间还没有绑定会话。')
-        else await reply(`当前会话：\`${handle.agent.id}\`（状态 ${handle.agent.status}）`)
+        const identity = this.isMain ? '主账号' : `数字分身（Owner: ${this.owner ?? '未配置'}）`
+        if (handle === undefined) await reply(`本房间还没有绑定会话。\n身份：${identity}\n账号：${this.userId}`)
+        else await reply(`当前会话：\`${handle.agent.id}\`（状态 ${handle.agent.status}）\n身份：${identity}\n账号：${this.userId}`)
         break
       }
       case '/bind': {
@@ -333,7 +370,7 @@ export class MatrixBridge {
         try {
           const handle = await this.ctx.agents.resume({
             resumeSessionId: SessionId(arg),
-            agentOptions: this.agentOptions(),
+            agentOptions: this.agentOptions,
           })
           this.roomAgents.set(roomId, handle)
           this.state.setRoomSession(roomId, handle.agent.id)
@@ -344,35 +381,43 @@ export class MatrixBridge {
         break
       }
       case '/auth': {
-        const spaceIdx = arg.indexOf(' ')
-        const subCmd = spaceIdx < 0 ? arg : arg.slice(0, spaceIdx)
-        const toolName = spaceIdx < 0 ? '' : arg.slice(spaceIdx + 1).trim()
+        const [subCmd, ...toolParts] = arg.split(/\s+/)
+        const toolName = toolParts.join(' ').trim()
         switch (subCmd) {
           case 'list': {
-            const record = this.authStore.getRecord(this.config.userId, roomId)
+            const record = this.authStore.getRecord(this.userId, roomId)
             if (record === undefined) {
-              await reply('📋 本房间暂无记忆授权记录。')
+              await reply(`📋 ${this.userId} 在本房间暂无记忆授权。`)
               break
             }
             await reply(
-              `📋 本房间记忆授权\n` +
+              `📋 ${this.userId} 在本房间的记忆授权\n` +
+              `Owner：${record.ownerId}\n` +
               `工具：${record.allowedTools.length > 0 ? record.allowedTools.map((t) => `\`${t}\``).join('、') : '无'}\n` +
               `最后确认：${new Date(record.lastConfirmedAt).toLocaleString('zh-CN')}`,
             )
             break
           }
           case 'revoke': {
+            if (!this.isMain && sender !== this.owner) {
+              await reply('❌ 只有 Owner 可以吊销授权。')
+              break
+            }
             if (toolName === '') {
               await reply('用法：`/auth revoke <tool>`')
               break
             }
-            const ok = this.authStore.revoke(this.config.userId, roomId, toolName)
+            const ok = this.authStore.revoke(this.userId, roomId, toolName)
             await this.authStore.save().catch(() => {})
             await reply(ok ? `✅ 已吊销 \`${toolName}\` 的记忆授权。` : `⚠️ \`${toolName}\` 本来就没有授权。`)
             break
           }
           case 'revoke-all': {
-            const ok = this.authStore.revoke(this.config.userId, roomId)
+            if (!this.isMain && sender !== this.owner) {
+              await reply('❌ 只有 Owner 可以吊销授权。')
+              break
+            }
+            const ok = this.authStore.revoke(this.userId, roomId)
             await this.authStore.save().catch(() => {})
             await reply(ok ? '✅ 已吊销本房间全部记忆授权。' : '⚠️ 本房间本来就没有授权。')
             break
@@ -387,7 +432,9 @@ export class MatrixBridge {
     }
   }
 
-  private handleSessionEvent(session: Session, event: SessionEvent): void {
+  /** ---------- 出站投递 ---------- */
+
+  handleSessionEvent(session: Session, event: SessionEvent): void {
     const roomId = this.roomForSession(session.id)
     if (roomId === undefined) return
     switch (event.type) {
@@ -415,7 +462,6 @@ export class MatrixBridge {
     }
   }
 
-  /** 发送；HTML 失败时回退纯文本（与 telegram 桥同款策略）。 */
   private async safeSend(roomId: string, plain: string, html?: string): Promise<void> {
     try {
       await this.channel.sendText(roomId, plain, html)
@@ -432,7 +478,22 @@ export class MatrixBridge {
     }
   }
 
-  private askRoom(roomId: string, request: ApprovalRequest, grantOnApprove: boolean): Promise<ApprovalOutcome> {
+  /** ---------- 审批（三级授权） ---------- */
+
+  handleApproval(roomId: string, request: ApprovalRequest): Promise<ApprovalOutcome> {
+    const grantable = !this.isRedline(request.toolName)
+    if (grantable && this.authStore.isStandingAuthorized(this.userId, roomId, request.toolName, this.config.redlineTools ?? [])) {
+      this.ctx.logger.info('[dsh-matrix] %s uses standing auth for `%s` in %s', this.userId, request.toolName, roomId)
+      return Promise.resolve('allowed-once')
+    }
+    return this.askRoom(roomId, request, grantable)
+  }
+
+  private askRoom(
+    roomId: string,
+    request: ApprovalRequest,
+    grantOnApprove: boolean,
+  ): Promise<ApprovalOutcome> {
     return new Promise<ApprovalOutcome>((resolve) => {
       const timer = setTimeout(() => settle('unavailable'), this.config.approvalTimeoutSecs * 1000)
       let done = false
@@ -444,19 +505,25 @@ export class MatrixBridge {
         if (queue !== undefined) {
           const index = queue.findIndex((entry) => entry.settle === settle)
           if (index >= 0) queue.splice(index, 1)
-          if (queue.length === 0) this.pendingApprovals.delete(roomId)
+          if (queue.length === 0) {
+            this.pendingApprovals.delete(roomId)
+            this.pendingRooms.delete(roomId)
+          }
         }
         resolve(outcome)
       }
       const queue = this.pendingApprovals.get(roomId) ?? []
       queue.push({ request, grantOnApprove, settle })
       this.pendingApprovals.set(roomId, queue)
+      this.pendingRooms.add(roomId)
       request.signal?.addEventListener('abort', () => settle('cancelled'), { once: true })
 
+      const who = this.owner !== undefined ? `@${localpartOf(this.owner)}` : ''
       const redlineNote = this.isRedline(request.toolName) ? ' ⛔️红线工具，每次都需确认' : ''
+      const scopeNote = this.owner !== undefined ? `\n👉 仅 Owner ${who} 可以应答。` : ''
       const text =
-        `⚠️ [审批请求${redlineNote}] 工具 \`${request.toolName}\` 需要批准` +
-        `${request.reason ? `，原因：${request.reason}` : ''}。请在 ${this.config.approvalTimeoutSecs} 秒内回复「批准」或「拒绝」。`
+        `⚠️ [审批请求${redlineNote}] 账号 \`${this.userId}\` 的工具 \`${request.toolName}\` 需要批准` +
+        `${request.reason ? `，原因：${request.reason}` : ''}。请在 ${this.config.approvalTimeoutSecs} 秒内回复「批准」或「拒绝」。${scopeNote}`
       void this.safeSend(roomId, text, markdownToHtml(text))
     })
   }
@@ -465,6 +532,127 @@ export class MatrixBridge {
     const queue = this.pendingApprovals.get(roomId)
     if (queue === undefined) return
     this.pendingApprovals.delete(roomId)
+    this.pendingRooms.delete(roomId)
     for (const entry of queue) entry.settle(outcome)
+  }
+}
+
+export interface MatrixBridgeOptions extends Config {
+  readonly accessToken: string
+  /** 测试接缝：替换通道层的 fetch 与 sleep。 */
+  readonly fetchFn?: typeof fetch
+  readonly sleep?: (ms: number) => Promise<void>
+}
+
+/**
+ * 多账号桥接编排器：
+ * - 主账号 + config.digitalTwins 里的每个分身各对应一个 AccountBridge 实例；
+ * - 共享同一个记忆授权库（AuthStore）；
+ * - session/event 与 approval/request 统一分发到所属账号的 bridge 处理。
+ */
+export class MatrixBridge {
+  private readonly ctx: Context
+  private readonly config: MatrixBridgeOptions
+  private readonly authStore: AuthStore
+  private readonly accounts: AccountBridge[] = []
+  private disposeEvents: (() => void) | undefined
+  private disposeApproval: (() => void) | undefined
+
+  constructor(ctx: Context, config: MatrixBridgeOptions) {
+    this.ctx = ctx
+    this.config = config
+    this.authStore = new AuthStore(config.stateDir, config.authStoreFile ?? 'auth-store.json')
+
+    // 所有账号 id（主账号 + 分身），用于 @提及 路由裁决。
+    const allAccountIds = [
+      config.userId,
+      ...(config.digitalTwins ?? []).map((t) => t.userId),
+    ]
+    // 共享「房间有 pending 审批」集合：多账号协调审批应答归属。
+    const pendingRooms = new Set<string>()
+
+    // 1. 挂载主账号（保持 state.json 名字，向后兼容）
+    const mainAccount: DigitalTwinAccount = {
+      userId: config.userId,
+      accessToken: config.accessToken,
+      tokenEnv: '',
+      owner: '',
+      role: 'main',
+      respondToAll: true,
+      provider: config.provider,
+      model: config.model,
+    }
+    this.accounts.push(
+      new AccountBridge(
+        ctx,
+        config,
+        new BridgeState(join(config.stateDir, 'state.json')),
+        this.authStore,
+        mainAccount,
+        allAccountIds,
+        pendingRooms,
+        config.fetchFn,
+        config.sleep,
+      ),
+    )
+
+    // 2. 挂载额外的数字分身（每个拥有独立的 state 子文件，避免房间绑定键冲突）
+    for (const twin of config.digitalTwins ?? []) {
+      if (twin.userId === config.userId) continue
+      const token = twin.accessToken !== '' ? twin.accessToken : (twin.tokenEnv !== '' ? process.env[twin.tokenEnv] : undefined)
+      if (token === undefined || token === '') {
+        ctx.logger.warn('[dsh-matrix] twin %s skipped: no access token (set accessToken or tokenEnv)', twin.userId)
+        continue
+      }
+      const twinState = new BridgeState(join(config.stateDir, 'twins', `${localpartOf(twin.userId)}.json`))
+      this.accounts.push(
+        new AccountBridge(
+          ctx,
+          config,
+          twinState,
+          this.authStore,
+          { ...twin, accessToken: token },
+          allAccountIds,
+          pendingRooms,
+          config.fetchFn,
+          config.sleep,
+        ),
+      )
+    }
+  }
+
+  async start(): Promise<void> {
+    if (this.disposeEvents !== undefined) return
+    await this.authStore.load()
+
+    this.disposeEvents = this.ctx.on('session/event', (session, event) => {
+      for (const account of this.accounts) {
+        account.handleSessionEvent(session, event)
+      }
+    })
+
+    this.ctx.inject(['approval'], (approvalCtx) => {
+      this.disposeApproval = approvalCtx.on('approval/request', async (req, next) => {
+        for (const account of this.accounts) {
+          const roomId = account.roomForSession(req.agent.id)
+          if (roomId !== undefined) return account.handleApproval(roomId, req)
+        }
+        return next()
+      })
+    })
+
+    await Promise.all(this.accounts.map((account) => account.start()))
+  }
+
+  async stop(): Promise<void> {
+    if (this.disposeEvents !== undefined) {
+      this.disposeEvents()
+      this.disposeEvents = undefined
+    }
+    this.disposeApproval?.()
+    this.disposeApproval = undefined
+    await Promise.allSettled(this.accounts.map((account) => account.stop()))
+    this.accounts.length = 0
+    await this.authStore.save().catch(() => {})
   }
 }
