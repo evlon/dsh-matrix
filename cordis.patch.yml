@@ -4,14 +4,14 @@
     - id: matrix
       name: dsh-matrix
       config:
-        homeserverUrl: 'https://matrix-client.matrix.org'
-        userId: '@dsh-bot:matrix.org'
+        homeserverUrl: 'https://im-ipm.ict.cmcc'
+        userId: '@ai-niukunliang:im-ipm.ict.cmcc'
         # accessToken 留空时回退到环境变量 DSH_MATRIX_TOKEN（两者都没有则插件加载失败）
-        accessToken: ''
+        accessToken: '9EQqkAe1sIg3ykjTkVkygsPqOVnYbb1LPb1l7Iv8lUM'
         # 白名单为空且 allowAllUsers=false 时拒绝所有入站消息（fail closed）
         allowedUserIds: []
-        allowAllUsers: false
-        provider: 'deepseek-official'
+        allowAllUsers: true
+        provider: 'sharkai'
         model: 'deepseek-v4-flash'
         chunkMaxChars: 4000
         mergeTimeoutSecs: 5

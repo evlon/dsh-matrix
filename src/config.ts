@@ -1,20 +1,42 @@
 import Schema from '@deepseek-ai/schemastery'
 
+/** 数字分身 Matrix 账号：一个真实员工名下的一个分身，独立 access token 与 agent 会话空间。 */
+export interface DigitalTwinAccount {
+  /** 分身的 Matrix 用户 id，如 '@ai-zhang-dev:im-ipm.ict.cmcc'。 */
+  userId: string
+  /** 直接内联的 access token（优先于 tokenEnv；生产建议用 tokenEnv）。 */
+  accessToken: string
+  /** 从环境变量读取 token 的变量名，如 DSH_MATRIX_AI_ZHANG_DEV_TOKEN。 */
+  tokenEnv: string
+  /** 工作责任负责人（主人）的 Matrix 用户 id。 */
+  owner: string
+  /** 角色标签（leader/pm/dev/qa/custom），仅作展示与路由提示。 */
+  role: string
+  /**
+   * 是否响应房间里所有消息。
+   * 省略时：主账号默认 true（个人助手模式），分身账号默认 false（@提及才响应）。
+   */
+  respondToAll: boolean
+  /** 覆盖顶层 provider/model；留空回退顶层值。 */
+  provider: string
+  model: string
+}
+
 /** dsh-matrix 插件配置。所有字段都可在 cordis.patch.yml 的行 config 中覆盖。 */
 export interface Config {
   /** Matrix homeserver 的 client-server API base URL。 */
   homeserverUrl: string
-  /** Bot 的 access token；为空时回退到环境变量 DSH_MATRIX_TOKEN。 */
+  /** 主账号 access token；为空时回退到环境变量 DSH_MATRIX_TOKEN。 */
   accessToken: string
-  /** Bot 的 Matrix 用户 id，如 '@dsh-bot:example.org'。 */
+  /** 主账号 Matrix 用户 id（通常是员工自己的数字主分身或个人助手）。 */
   userId: string
   /** 允许与 bot 对话的 Matrix 用户 id 白名单；为空且 allowAllUsers=false 时拒绝所有人。 */
   allowedUserIds: string[]
   /** 允许任意用户（仅开发用）。 */
   allowAllUsers: boolean
-  /** 每个房间 agent 使用的 LLM provider 路由。 */
+  /** 默认 LLM provider 路由（分身未指定时使用）。 */
   provider: string
-  /** 每个房间 agent 使用的模型 id。 */
+  /** 默认模型 id（分身未指定时使用）。 */
   model: string
   /** 出站单条消息的最大字符数（含分段前缀）。 */
   chunkMaxChars: number
@@ -22,8 +44,18 @@ export interface Config {
   mergeTimeoutSecs: number
   /** 审批请求推送到聊天后等待回复的秒数，超时按 unavailable 处理。 */
   approvalTimeoutSecs: number
-  /** 桥接状态文件目录（房间↔会话映射、去重环、sync token）。 */
+  /** 桥接状态文件目录（房间↔会话映射、去重环、sync token、授权记录）。 */
   stateDir: string
+
+  // ========== 数字分身支持 ==========
+  /** 启用数字分身模式：@提及路由、Owner 授权记忆、红线强制确认。 */
+  digitalTwinMode: boolean
+  /** 额外的数字分身账号列表（主账号之外，每个分身一个独立 Matrix 账号）。 */
+  digitalTwins: DigitalTwinAccount[]
+  /** 授权记录文件名（相对 stateDir）。 */
+  authStoreFile: string
+  /** 红线工具列表：即使有长期授权也必须每次房间确认。 */
+  redlineTools: string[]
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -38,4 +70,18 @@ export const Config: Schema<Config> = Schema.object({
   mergeTimeoutSecs: Schema.number().default(5),
   approvalTimeoutSecs: Schema.number().default(300),
   stateDir: Schema.string().default('.dsh-matrix'),
+
+  digitalTwinMode: Schema.boolean().default(false),
+  digitalTwins: Schema.array(Schema.object({
+    userId: Schema.string().required(),
+    accessToken: Schema.string().default(''),
+    tokenEnv: Schema.string().default(''),
+    owner: Schema.string().default(''),
+    role: Schema.string().default(''),
+    respondToAll: Schema.boolean().default(false),
+    provider: Schema.string().default(''),
+    model: Schema.string().default(''),
+  })).default([]),
+  authStoreFile: Schema.string().default('auth-store.json'),
+  redlineTools: Schema.array(Schema.string()).default(['bash', 'pwsh', 'write', 'edit']),
 })

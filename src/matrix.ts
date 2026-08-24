@@ -43,6 +43,8 @@ export interface Channel {
   stop(): Promise<void>
   sendText(roomId: string, plain: string, html?: string): Promise<void>
   sendTyping(roomId: string, active: boolean): Promise<void>
+  /** 判断是否为私聊房间（2 人房间）。 */
+  isDirectRoom?(roomId: string): Promise<boolean>
 }
 
 /** /sync 响应中我们关心的最小结构。 */
@@ -65,12 +67,14 @@ interface MatrixEventJson {
 const SYNC_TIMEOUT_MS = 30_000
 const SYNC_FILTER = JSON.stringify({ room: { timeline: { limit: 10 } } })
 const BASE_BACKOFF_MS = 1000
+const DM_CACHE_TTL_MS = 60_000
 
 export class MatrixChannel implements Channel {
   private readonly baseUrl: string
   private readonly fetchFn: typeof fetch
   private readonly sleepFn: (ms: number) => Promise<void>
   private readonly warnedEncrypted = new Set<string>()
+  private readonly dmCache = new Map<string, { isDm: boolean; at: number }>()
   private stopped = false
   private loop: Promise<void> | undefined
   private lifecycleAbort: AbortController | undefined
@@ -196,6 +200,26 @@ export class MatrixChannel implements Channel {
       body: JSON.stringify(body),
     })
     if (!response.ok) throw new Error(`typing HTTP ${response.status}`)
+  }
+
+  /** 判断房间是否为私聊（≤2 人）。带 TTL 缓存，失败时保守返回 false（按群聊处理）。 */
+  async isDirectRoom(roomId: string): Promise<boolean> {
+    const cached = this.dmCache.get(roomId)
+    if (cached !== undefined && Date.now() - cached.at < DM_CACHE_TTL_MS) return cached.isDm
+    try {
+      const url = `${this.baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/joined_members`
+      const response = await this.fetchFn(url, {
+        headers: { Authorization: `Bearer ${this.options.accessToken}` },
+      })
+      if (!response.ok) throw new Error(`joined_members HTTP ${response.status}`)
+      const data = (await response.json()) as { joined?: Record<string, unknown> }
+      const count = data.joined === undefined ? 0 : Object.keys(data.joined).length
+      const isDm = count > 0 && count <= 2
+      this.dmCache.set(roomId, { isDm, at: Date.now() })
+      return isDm
+    } catch {
+      return false
+    }
   }
 
   private async joinRoom(roomId: string): Promise<void> {

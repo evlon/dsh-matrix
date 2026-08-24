@@ -17,8 +17,9 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { MatrixBridge } from './bridge.js'
-import type { Config as MatrixConfig } from './config.js'
+import type { Config as MatrixConfig, DigitalTwinAccount } from './config.js'
 
+export * from './auth-store.js'
 export * from './bridge.js'
 export * from './config.js'
 export * from './format.js'
@@ -37,7 +38,8 @@ export function apply(ctx: Context, config: MatrixConfig): void {
   if (config.allowedUserIds.length === 0 && !config.allowAllUsers) {
     ctx.logger.warn('[dsh-matrix] no allowlist configured: all inbound messages will be rejected (fail closed)')
   }
-  const bridge = new MatrixBridge(ctx, { ...config, accessToken: token })
+  const twins: DigitalTwinAccount[] = config.digitalTwinMode ? (config.digitalTwins ?? []) : []
+  const bridge = new MatrixBridge(ctx, { ...config, accessToken: token, digitalTwins: twins })
   ctx.effect(() => {
     void bridge.start()
     return () => {

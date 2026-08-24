@@ -2,6 +2,8 @@
  * Matrix→harness 桥接层：per-room agent 会话、入站消息注入、出站投递、
  * 审批推送与聊天应答、命令与合并窗口。只依赖 Channel 接口，与具体协议无关。
  *
+ * 在原版基础上新增：Owner 授权记忆（L1 记忆授权 / L2 房间确认 / L3 红线强制）。
+ *
  * @module dsh-matrix/bridge
  */
 
@@ -19,6 +21,7 @@ import { chunkText, markdownToHtml } from './format.js'
 import { MatrixChannel } from './matrix.js'
 import type { Channel, InboundMessage } from './matrix.js'
 import { BridgeState } from './store.js'
+import { AuthStore } from './auth-store.js'
 
 const APPROVE_RE = /^(批准|同意|approve|yes|ok)$/i
 const DENY_RE = /^(拒绝|驳回|deny|no|reject)$/i
@@ -29,6 +32,9 @@ const HELP_TEXT = [
   '/new — 开始一个全新会话',
   '/clear — 重置当前会话（同 /new）',
   '/bind <session-id> — 把本房间绑定到已有会话（需要 session persistence）',
+  '/auth list — 列出本房间的记忆授权',
+  '/auth revoke <tool> — 吊销某工具的记忆授权',
+  '/auth revoke-all — 吊销本房间全部记忆授权',
   '',
   '消息合并：以 `..` 结尾表示还有后续，以 `!!` 结尾表示立即提交，裸文本进入合并窗口。',
 ].join('\n')
@@ -40,6 +46,8 @@ interface MergeBuffer {
 
 interface PendingApproval {
   readonly request: ApprovalRequest
+  /** 批准后是否写入记忆授权（红线工具为 false）。 */
+  readonly grantOnApprove: boolean
   readonly settle: (outcome: ApprovalOutcome) => void
 }
 
@@ -64,6 +72,7 @@ export class MatrixBridge {
   private readonly ctx: Context
   private readonly config: MatrixBridgeOptions
   private readonly state: BridgeState
+  private readonly authStore: AuthStore
   private readonly channel: Channel
   private readonly roomAgents = new Map<string, AgentHandle>()
   private readonly mergeBuffers = new Map<string, MergeBuffer>()
@@ -76,6 +85,7 @@ export class MatrixBridge {
     this.ctx = ctx
     this.config = config
     this.state = new BridgeState(join(config.stateDir, 'state.json'))
+    this.authStore = new AuthStore(config.stateDir, config.authStoreFile ?? 'auth-store.json')
     this.channel = new MatrixChannel({
       homeserverUrl: config.homeserverUrl,
       accessToken: config.accessToken,
@@ -94,6 +104,7 @@ export class MatrixBridge {
   async start(): Promise<void> {
     if (this.disposeEvents !== undefined) return
     await this.state.load()
+    await this.authStore.load()
     this.disposeEvents = this.ctx.on('session/event', (session, event) => {
       this.handleSessionEvent(session, event)
     })
@@ -101,7 +112,7 @@ export class MatrixBridge {
       this.disposeApproval = approvalCtx.on('approval/request', async (req, next) => {
         const roomId = this.roomForSession(req.agent.id)
         if (roomId === undefined) return next()
-        return this.askRoom(roomId, req)
+        return this.handleApproval(roomId, req)
       })
     })
     await this.connectWithRetry()
@@ -127,6 +138,7 @@ export class MatrixBridge {
     await Promise.allSettled(handles.map((handle) => handle.dispose()))
     await this.channel.stop()
     await this.state.dispose()
+    await this.authStore.save().catch(() => {})
   }
 
   private async connectWithRetry(): Promise<void> {
@@ -158,9 +170,28 @@ export class MatrixBridge {
     return this.state.sessionRoom(sessionId)
   }
 
+  /** 红线工具判定：即使有记忆授权也必须每次房间确认。 */
+  private isRedline(toolName: string): boolean {
+    return (this.config.redlineTools ?? []).includes(toolName)
+  }
+
   /**
-   * 房间的当前 agent：内存缓存 → 持久绑定 resume（需要 session persistence）→ 新建。
-   * 会话 id 用随机 uuid（带 matrix- 前缀、无非法文件名字符），绑定关系落盘。
+   * 审批决策入口：
+   * - L3 红线：永远进房间确认，批准不入库；
+   * - L1 记忆授权：静默放行；
+   * - L2 其余：进房间确认；批准后写入记忆授权。
+   */
+  private handleApproval(roomId: string, request: ApprovalRequest): Promise<ApprovalOutcome> {
+    const grantable = !this.isRedline(request.toolName)
+    if (grantable && this.authStore.isStandingAuthorized(this.config.userId, roomId, request.toolName, this.config.redlineTools ?? [])) {
+      this.ctx.logger.info('[dsh-matrix] standing auth for `%s` in %s', request.toolName, roomId)
+      return Promise.resolve('allowed-once')
+    }
+    return this.askRoom(roomId, request, grantable)
+  }
+
+  /**
+   * 房间的当前 agent：内存缓存 → 持久绑定 resume → 新建。
    */
   private async getRoomAgent(roomId: string): Promise<Agent> {
     const existing = this.roomAgents.get(roomId)
@@ -212,6 +243,12 @@ export class MatrixBridge {
       const first = this.pendingApprovals.get(message.roomId)?.[0]
       if (first !== undefined) {
         if (APPROVE_RE.test(text)) {
+          if (first.grantOnApprove) {
+            this.authStore.grant(this.config.userId, this.config.userId, message.roomId, first.request.toolName)
+            void this.authStore.save().catch((error: unknown) => {
+              this.ctx.logger.error('[dsh-matrix] auth save failed: %s', messageOf(error))
+            })
+          }
           first.settle('allowed-once')
           return
         }
@@ -270,6 +307,7 @@ export class MatrixBridge {
     const [command, ...rest] = raw.split(/\s+/)
     const arg = rest.join(' ').trim()
     const reply = (text: string) => this.safeSend(roomId, text, markdownToHtml(text))
+
     switch (command) {
       case '/start':
       case '/help':
@@ -302,6 +340,45 @@ export class MatrixBridge {
           await reply(`已绑定会话 \`${handle.agent.id}\`。`)
         } catch (error) {
           await reply(`绑定失败：${messageOf(error)}（需要在组合中配置 session persistence）`)
+        }
+        break
+      }
+      case '/auth': {
+        const spaceIdx = arg.indexOf(' ')
+        const subCmd = spaceIdx < 0 ? arg : arg.slice(0, spaceIdx)
+        const toolName = spaceIdx < 0 ? '' : arg.slice(spaceIdx + 1).trim()
+        switch (subCmd) {
+          case 'list': {
+            const record = this.authStore.getRecord(this.config.userId, roomId)
+            if (record === undefined) {
+              await reply('📋 本房间暂无记忆授权记录。')
+              break
+            }
+            await reply(
+              `📋 本房间记忆授权\n` +
+              `工具：${record.allowedTools.length > 0 ? record.allowedTools.map((t) => `\`${t}\``).join('、') : '无'}\n` +
+              `最后确认：${new Date(record.lastConfirmedAt).toLocaleString('zh-CN')}`,
+            )
+            break
+          }
+          case 'revoke': {
+            if (toolName === '') {
+              await reply('用法：`/auth revoke <tool>`')
+              break
+            }
+            const ok = this.authStore.revoke(this.config.userId, roomId, toolName)
+            await this.authStore.save().catch(() => {})
+            await reply(ok ? `✅ 已吊销 \`${toolName}\` 的记忆授权。` : `⚠️ \`${toolName}\` 本来就没有授权。`)
+            break
+          }
+          case 'revoke-all': {
+            const ok = this.authStore.revoke(this.config.userId, roomId)
+            await this.authStore.save().catch(() => {})
+            await reply(ok ? '✅ 已吊销本房间全部记忆授权。' : '⚠️ 本房间本来就没有授权。')
+            break
+          }
+          default:
+            await reply('用法：`/auth list` | `/auth revoke <tool>` | `/auth revoke-all`')
         }
         break
       }
@@ -355,7 +432,7 @@ export class MatrixBridge {
     }
   }
 
-  private askRoom(roomId: string, request: ApprovalRequest): Promise<ApprovalOutcome> {
+  private askRoom(roomId: string, request: ApprovalRequest, grantOnApprove: boolean): Promise<ApprovalOutcome> {
     return new Promise<ApprovalOutcome>((resolve) => {
       const timer = setTimeout(() => settle('unavailable'), this.config.approvalTimeoutSecs * 1000)
       let done = false
@@ -372,10 +449,14 @@ export class MatrixBridge {
         resolve(outcome)
       }
       const queue = this.pendingApprovals.get(roomId) ?? []
-      queue.push({ request, settle })
+      queue.push({ request, grantOnApprove, settle })
       this.pendingApprovals.set(roomId, queue)
       request.signal?.addEventListener('abort', () => settle('cancelled'), { once: true })
-      const text = `⚠️ [审批请求] 工具 \`${request.toolName}\` 需要批准${request.reason ? `，原因：${request.reason}` : ''}。请在 ${this.config.approvalTimeoutSecs} 秒内回复「批准」或「拒绝」。`
+
+      const redlineNote = this.isRedline(request.toolName) ? ' ⛔️红线工具，每次都需确认' : ''
+      const text =
+        `⚠️ [审批请求${redlineNote}] 工具 \`${request.toolName}\` 需要批准` +
+        `${request.reason ? `，原因：${request.reason}` : ''}。请在 ${this.config.approvalTimeoutSecs} 秒内回复「批准」或「拒绝」。`
       void this.safeSend(roomId, text, markdownToHtml(text))
     })
   }
