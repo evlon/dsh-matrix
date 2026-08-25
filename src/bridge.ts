@@ -405,6 +405,7 @@ export class AccountBridge {
         const handle = await this.ctx.agents.resume({
           resumeSessionId: bindingId,
           agentOptions: this.agentOptions,
+          setup: this.agentSetup(),
         })
         this.roomAgents.set(roomId, handle)
         return handle.agent
@@ -436,6 +437,28 @@ export class AccountBridge {
     // 会话标题 = Matrix 房间名（pin 住，自动标题不再覆盖）。
     void this.nameSessionFromRoom(roomId, handle.agent)
     return handle.agent
+  }
+
+  /**
+   * 构建 agent 的 setup 回调：在 agent scope 上 compose 配置指定的 preset，使
+   * shell/file/检索/skills 等工具挂载到该 agent。harness 的 GUI 会话由 host 自动注入
+   * 此 setup；dsh-matrix 直接走 ctx.agents.create/resume（底层 factory），必须自己传
+   * setup，否则 agent 不 compose 任何 preset → 工具不可见（agent 侧报 "unknown tool"）。
+   */
+  private agentSetup(): (agentCtx: Context) => Promise<void> {
+    const preset = this.config.agentPreset ?? 'standard'
+    return async (agentCtx: Context) => {
+      // agentPresets 是 host 平面服务（host-plane），不在 dsh-matrix 插件 ctx 的类型声明里，
+      // 不能用 this.ctx.agentPresets（会触发 cordis "without inject"）。用 this.ctx.get() 动态
+      // 取 host 服务实例，再把 preset 挂载到 setup 回调传入的 agent scope（agentCtx）上。
+      const presets = this.ctx.get('agentPresets') as
+        | { mount(c: Context, id: string): Promise<unknown> }
+        | undefined
+      if (!presets) {
+        throw new Error('agentPresets service is not available on the host context')
+      }
+      await presets.mount(agentCtx, preset)
+    }
   }
 
   /**
@@ -474,6 +497,7 @@ export class AccountBridge {
       return await this.ctx.agents.resume({
         resumeSessionId: sessionId,
         agentOptions: this.agentOptions,
+        setup: this.agentSetup(),
       })
     } catch (resumeError) {
       const reason = messageOf(resumeError)
@@ -487,6 +511,7 @@ export class AccountBridge {
             agentPreset: this.config.agentPreset ?? 'standard',
           },
           agentOptions: this.agentOptions,
+          setup: this.agentSetup(),
         })
       }
       // 4) 内核并发 prepare 撞车：轮询等待内核把会话注册到 agents 表后取用。
