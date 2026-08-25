@@ -73,6 +73,12 @@ export interface Config {
   authStoreFile: string
   /** 红线工具列表：即使有长期授权也必须每次房间确认。 */
   redlineTools: string[]
+
+  // ========== Matrix 任务队列 ==========
+  /** 新房间工作目录引导的候选目录列表；首项作为缺省。 */
+  cwdCandidates: string[]
+  /** 单个房间 matrix 任务队列上限，超出后最早 pending 任务被自动拒绝。 */
+  taskQueueMax: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -106,4 +112,7 @@ export const Config: Schema<Config> = Schema.object({
   })).default([]),
   authStoreFile: Schema.string().default('auth-store.json'),
   redlineTools: Schema.array(Schema.string()).default(['bash', 'pwsh', 'write', 'edit']),
+
+  cwdCandidates: Schema.array(Schema.string()).default([process.cwd()]),
+  taskQueueMax: Schema.number().default(20),
 })

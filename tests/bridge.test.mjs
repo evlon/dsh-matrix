@@ -95,13 +95,19 @@ function makeCtx() {
         })
       },
       agents: {
+        get() { return undefined },
         async create({ sessionId }) {
           const agent = { id: sessionId, status: 'idle', session: { id: sessionId }, followup(message) { captured.messages.push(message) } }
           const handle = { agent, async dispose() {} }
           captured.agents.push(handle)
           return handle
         },
-        async resume() { throw new Error('session persistence is not configured') },
+        async resume({ sessionId }) {
+          const agent = { id: sessionId, status: 'idle', session: { id: sessionId }, followup(message) { captured.messages.push(message) } }
+          const handle = { agent, async dispose() {} }
+          captured.agents.push(handle)
+          return handle
+        },
       },
     },
   }

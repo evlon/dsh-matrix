@@ -9,6 +9,7 @@
  */
 
 import { join } from 'node:path'
+import { existsSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -17,11 +18,12 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import type { Config, DigitalTwinAccount } from './config.js'
-import { chunkText, markdownToHtml, formatToolCall, describeMedia, wantsProcess, formatToolResult, formatTurnEnd, formatRetry, formatRetryCircuitTripped } from './format.js'
-import type { Verbosity } from './format.js'
+import { chunkText, markdownToHtml, formatToolCall, describeMedia, wantsProcess, formatToolResult, formatTurnEnd, formatRetry, formatRetryCircuitTripped, formatTasks, formatCwdGuide, formatRules, formatWorkspaceState } from './format.js'
+import type { Verbosity, WorkspaceState } from './format.js'
 import { MatrixChannel } from './matrix.js'
 import type { Channel, InboundMessage } from './matrix.js'
 import { BridgeState } from './store.js'
+import type { MatrixTask, AllowDenyRule } from './store.js'
 import { AuthStore } from './auth-store.js'
 
 const APPROVE_RE = /^(批准|同意|approve|yes|ok)$/i
@@ -36,6 +38,15 @@ const HELP_TEXT = [
   '/auth list — 列出本分身在本房间的记忆授权',
   '/auth revoke <tool> — 吊销某工具的记忆授权（仅 Owner）',
   '/auth revoke-all — 吊销本房间全部记忆授权（仅 Owner）',
+  '',
+  '— Matrix 任务队列（数字分身收件箱）—',
+  '/tasks — 查看本房间任务面板（待审/已办、工作目录状态）',
+  '/queue — 同 /tasks，刷新任务列表',
+  '/approve <N> — 执行第 N 条待审任务（新房间需先选工作目录）',
+  '/reject <N> — 拒绝第 N 条待审任务',
+  '/allow <人> <事> — 加白名单（人/事可填 * 通配）',
+  '/deny <人> <事> — 加黑名单（人/事可填 * 通配）',
+  '/rules — 查看黑白名单',
   '',
   '消息合并：以 `..` 结尾表示还有后续，以 `!!` 结尾表示立即提交，裸文本进入合并窗口。',
 ].join('\n')
@@ -222,6 +233,19 @@ export class AccountBridge {
    * turn/end 时随 toolNames 一并清理，避免内存增长。
    */
   private readonly retryCounts = new Map<string, number>()
+  /**
+   * 房间级 matrix 任务队列（数字分身收件箱）：别的同事发来的待审工作。
+   * 内存镜像，与 state.matrixTasks 同步；数字分身模式下入站消息进此队列，
+   * 由 Owner 用 /approve 逐条授权后串行执行。
+   */
+  private readonly matrixTasks = new Map<string, MatrixTask[]>()
+  /**
+   * 等待选工作目录的房间：值为候选目录列表 + 暂存的待执行任务 id。
+   * 新房间首次 /approve 时若尚未绑定工作目录则进入此态。
+   */
+  private readonly cwdPending = new Map<string, { candidates: string[]; taskId: string }>()
+  /** 房间当前正在执行（已 approve、turn 进行中）的任务 id。 */
+  private readonly runningTask = new Map<string, string>()
 
   constructor(
     ctx: Context,
@@ -270,6 +294,10 @@ export class AccountBridge {
 
   async start(): Promise<void> {
     await this.state.load()
+    // 恢复各房间任务队列到内存镜像（重启不丢审核进度）。
+    for (const [roomId, tasks] of Object.entries(this.state.matrixTasksSnapshot())) {
+      this.matrixTasks.set(roomId, tasks)
+    }
     await this.connectWithRetry()
   }
 
@@ -357,50 +385,122 @@ export class AccountBridge {
   }
 
   private async createRoomAgent(roomId: string): Promise<Agent> {
+    // 内核已把某 session 恢复为 live 时，ctx.agents.get 返回 Agent（无 dispose 包装）。
+    // 这里包成 AgentHandle，与本函数其余路径（create/resume 返回的 AgentHandle）一致，
+    // 使 roomAgents 缓存与末尾 return handle.agent 逻辑统一。
+    const asHandle = (agent: Agent): AgentHandle => ({ agent, dispose: async () => {} })
+
     // 优先 resume 历史绑定（旧随机 id 会话的迁移路径）。
     const binding = this.state.roomSession(roomId)
     if (binding !== undefined) {
+      const bindingId = SessionId(binding)
+      // 内核启动可能已将该 session 恢复为 live，直接取用，避免重复 prepare。
+      const liveBinding = this.ctx.agents.get(bindingId)
+      if (liveBinding !== undefined) {
+        const handle = asHandle(liveBinding)
+        this.roomAgents.set(roomId, handle)
+        return handle.agent
+      }
       try {
         const handle = await this.ctx.agents.resume({
-          resumeSessionId: SessionId(binding),
+          resumeSessionId: bindingId,
           agentOptions: this.agentOptions,
         })
         this.roomAgents.set(roomId, handle)
         return handle.agent
       } catch (error) {
-        this.ctx.logger.warn('[dsh-matrix] resume %s failed (%s); falling back to deterministic id', binding, messageOf(error))
+        const reason = messageOf(error)
+        // 内核并发恢复导致已 live：取用内核已有会话，而非报错退出。
+        if (reason.includes('while it is live')) {
+          const live = this.ctx.agents.get(bindingId)
+          if (live !== undefined) {
+            const handle = asHandle(live)
+            this.roomAgents.set(roomId, handle)
+            return handle.agent
+          }
+        }
+        this.ctx.logger.warn('[dsh-matrix] resume %s failed (%s); falling back to deterministic id', binding, reason)
       }
     }
 
-    // 确定性会话 id：同一房间永远同一 id。agents.create 语义为首次创建；
-    // 若该 id 在当前 harness 进程/持久化里已存在，create 会抛错：
-    //   - "already exists"：store 中已有该会话；
-    //   - "while it is live"：并发或残留导致同一 id 已成 live 会话。
-    // 两种都改为 resume 复用既有会话（历史、GUI 会话都在），而不是报错退出，
-    // 也不是新建第二个。这样重启后同一房间回到同一会话，GUI 不再堆积多个"会话"。
+    // 确定性会话 id：同一房间永远同一 id。
+    // dsh web / GUI 启动时会主动恢复所有持久化会话使其成为 live，因此该 id 可能
+    // 已被内核加载并注册到 agents 表。先用既有 live agent：避免重复 create/resume
+    // 撞 "already exists" / "while it is live" / "id collision"。
     const sessionId = SessionId(`matrix-${localpartOf(this.userId)}-${stableHash(roomId)}`)
-    let handle: AgentHandle
-    try {
-      handle = await this.ctx.agents.create({
-        sessionId,
-        meta: { cwd: process.cwd(), agentPreset: this.config.agentPreset ?? 'standard' },
-        agentOptions: this.agentOptions,
-      })
-    } catch (error) {
-      const reason = messageOf(error)
-      if (!reason.includes('already exists') && !reason.includes('while it is live')) throw error
-      this.ctx.logger.warn('[dsh-matrix] session %s already live/exist (%s); resuming instead of recreating', sessionId, reason)
-      handle = await this.ctx.agents.resume({
-        resumeSessionId: sessionId,
-        agentOptions: this.agentOptions,
-      })
-    }
+    const handle = await this.acquireAgent(sessionId, {
+      cwd: this.state.roomCwd(roomId) ?? (this.config.cwdCandidates ?? [])[0] ?? process.cwd(),
+    })
     this.roomAgents.set(roomId, handle)
     this.state.setRoomSession(roomId, handle.agent.id)
     // 会话标题 = Matrix 房间名（pin 住，自动标题不再覆盖）。
     void this.nameSessionFromRoom(roomId, handle.agent)
     return handle.agent
   }
+
+  /**
+   * 取得（或恢复）某会话对应的 live agent，规避与内核自动加载的并发碰撞、以及
+   * create 时 cwd 与磁盘持久化值不一致导致的 "id collision"。
+   *
+   * 顺序：
+   *   1. 内核已加载并注册为 live agent —— 直接取用，绝不重复 prepare；
+   *   2. 先 resume 续接历史（不传 cwd，复用磁盘持久化的 cwd，避免 cwd 不匹配的 id collision）；
+   *   3. resume 因「无持久化 log」失败（全新会话）—— 用 create 新建（带 cwd）；
+   *   4. resume 撞 "while it is live"（内核并发 prepare 刚好完成）—— 轮询等待内核把
+   *      会话注册到 agents 表后取用，避免二次 prepare 撞车；
+   *   5. 其它 resume 失败（如 live turn 未关闭）也先轮询一次内核是否已就绪，仍失败再抛出。
+   */
+  private async acquireAgent(sessionId: SessionId, meta: { cwd: string }): Promise<AgentHandle> {
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+    const wrap = (agent: Agent): AgentHandle => ({ agent, dispose: async () => {} })
+    const waitForLive = async (label: string): Promise<AgentHandle | undefined> => {
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const live = this.ctx.agents.get(sessionId)
+        if (live !== undefined) {
+          if (attempt > 0) this.ctx.logger.info('[dsh-matrix] session %s live after %dms (%s)', sessionId, (attempt + 1) * 150, label)
+          return wrap(live)
+        }
+        await sleep(150)
+      }
+      return undefined
+    }
+
+    // 1) 内核已加载并注册为 live agent：直接取用，绝不重复 prepare。
+    const liveNow = this.ctx.agents.get(sessionId)
+    if (liveNow !== undefined) return wrap(liveNow)
+
+    // 2) resume 续接历史（不传 cwd，复用磁盘持久化 cwd，避免 cwd 不匹配的 id collision）。
+    try {
+      return await this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions: this.agentOptions,
+      })
+    } catch (resumeError) {
+      const reason = messageOf(resumeError)
+      // 3) 无持久化 log（全新会话）：create 新建（带 cwd）。
+      if (reason.includes('not found') || reason.includes('no such') || reason.includes('has no persisted')) {
+        this.ctx.logger.warn('[dsh-matrix] session %s has no persisted log; creating fresh', sessionId)
+        return this.ctx.agents.create({
+          sessionId,
+          meta: {
+            cwd: meta.cwd,
+            agentPreset: this.config.agentPreset ?? 'standard',
+          },
+          agentOptions: this.agentOptions,
+        })
+      }
+      // 4) 内核并发 prepare 撞车：轮询等待内核把会话注册到 agents 表后取用。
+      const waited = await waitForLive('resume-collision')
+      if (waited !== undefined) return waited
+      // 5) 其它 resume 失败：再轮询一次内核是否已就绪，仍失败抛出原始错误。
+      if (reason.includes('while it is live')) {
+        const waited2 = await waitForLive('resume-live')
+        if (waited2 !== undefined) return waited2
+      }
+      throw resumeError
+    }
+  }
+
 
   /** 若 Matrix 房间有名字，把 agent 会话标题固定为房间名。 */
   private async nameSessionFromRoom(roomId: string, agent: Agent): Promise<void> {
@@ -433,6 +533,9 @@ export class AccountBridge {
     this.toolNames.delete(roomId)
     this.roomVerbosity.delete(roomId)
     this.retryCounts.delete(roomId)
+    this.matrixTasks.delete(roomId)
+    this.cwdPending.delete(roomId)
+    this.runningTask.delete(roomId)
   }
 
   /** ---------- 入站消息 ---------- */
@@ -445,8 +548,13 @@ export class AccountBridge {
       const text = (message.text + describeMedia(message.media)).trim()
       if (text === '') return
 
-      // 剥离 @提及 前缀后再判定命令/审批词（如 '@ai-dev /auth list'）。
-      const stripped = text.replace(/@[a-z0-9._-]+(?::[a-z0-9._-]+)?/gi, '').trim()
+      // 剥离「已知账号」的 @提及 前缀后再判定命令/审批词（如 '@ai-dev /auth list'）。
+      // 仅去除本插件已知账号的提及，避免误删命令参数里的人名（如 /deny @alice:hs.example 机密）。
+      let stripped = text
+      for (const id of this.allAccountIds) {
+        stripped = stripped.replace(id, '').replace(`@${localpartOf(id)}`, '')
+      }
+      stripped = stripped.replace(/\s+/g, ' ').trim()
 
       // 偏好切换：检测过程模式触发词（"给我过程信息/我需要看到详细过程"等）。
       // 命中即把本房间切到 process；默认 result；命令不触发（命令以 '/' 开头）。
@@ -488,11 +596,41 @@ export class AccountBridge {
         return
       }
 
+      // 工作目录选择回复：房间处于 cwdPending 时，编号即选定目录（Owner 操作）。
+      const pending = this.cwdPending.get(message.roomId)
+      if (pending !== undefined) {
+        const idx = Number.parseInt(stripped, 10)
+        if (Number.isInteger(idx) && idx >= 1 && idx <= pending.candidates.length) {
+          const cwd = pending.candidates[idx - 1]
+          if (cwd === undefined) return
+          this.state.setRoomCwd(message.roomId, cwd)
+          this.cwdPending.delete(message.roomId)
+          this.ctx.logger.info('[dsh-matrix] room %s cwd set to %s', message.roomId, cwd)
+          // 选定后创建会话并执行暂存的任务。
+          const task = this.findTask(message.roomId, pending.taskId)
+          void this.safeSend(message.roomId, `✅ 已设定工作目录：\n${cwd}\n正在创建会话并执行任务…`, undefined)
+          if (task !== undefined) {
+            await this.executeTask(message.roomId, task)
+          }
+          return
+        }
+        // 非编号回复：提示重选。
+        void this.safeSend(message.roomId, '请回复编号选择工作目录，或发送 /reject 取消该任务。', undefined)
+        return
+      }
+
       if (!(await this.shouldRespond(message))) return
 
       if (stripped.startsWith('/')) {
         this.flushMerge(message.roomId)
         await this.handleCommand(message.roomId, message.sender, stripped)
+        return
+      }
+
+      // 数字分身模式：同事/主管发来的工作进 matrix 任务队列待审，不直接执行。
+      // 机器人自己账号发出的消息（如有）不进队列；命令已在上方处理。
+      if (this.config.digitalTwinMode && message.sender !== this.userId) {
+        await this.enqueueTask(message.roomId, message.sender, message.text)
         return
       }
 
@@ -545,6 +683,166 @@ export class AccountBridge {
         ...(sender !== undefined ? { sender } : {}),
       },
     }))
+  }
+
+  /** ---------- Matrix 任务队列 ---------- */
+
+  private tasksOf(roomId: string): MatrixTask[] {
+    let tasks = this.matrixTasks.get(roomId)
+    if (tasks === undefined) {
+      tasks = this.state.loadTasks(roomId)
+      this.matrixTasks.set(roomId, tasks)
+    }
+    return tasks
+  }
+
+  private persistTasks(roomId: string): void {
+    this.state.saveTasks(roomId, this.tasksOf(roomId))
+  }
+
+  private findTask(roomId: string, taskId: string): MatrixTask | undefined {
+    return this.tasksOf(roomId).find((t) => t.id === taskId)
+  }
+
+  /** 工作目录状态（供任务面板渲染）。 */
+  private workspaceStateOf(roomId: string): { state: WorkspaceState; cwd?: string } {
+    const cwd = this.state.roomCwd(roomId)
+    if (cwd === undefined) return { state: 'none' }
+    // 选了目录但路径不存在，提示（仅做轻量判定，不强制）。
+    if (!existsSync(cwd)) return { state: 'missing', cwd }
+    return { state: 'bound', cwd }
+  }
+
+  /** 把一条待审任务推给房间（精简面板）。 */
+  private async pushTasks(roomId: string): Promise<void> {
+    const text = formatTasks(this.tasksOf(roomId), this.workspaceStateOf(roomId))
+    await this.safeSend(roomId, text, markdownToHtml(text))
+  }
+
+  /**
+   * 入站消息进 matrix 任务队列：先查人+事黑白名单。
+   * - 命中黑名单 → 自动拒绝（记原因）；命中白名单 → 自动批准（记"记忆授权"）；
+   * - 否则 pending 等 Owner 用 /approve 审核。
+   * 队列超 taskQueueMax 时最早 pending 任务被自动拒绝（防堆积）。
+   */
+  private async enqueueTask(roomId: string, sender: string, text: string): Promise<void> {
+    const matter = this.classifyMatter(text)
+    const rule = this.state.matchRule(sender, matter) ?? this.state.matchRule(sender, '*')
+    const task: MatrixTask = {
+      id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      roomId,
+      sender,
+      text,
+      status: 'pending',
+      createdAt: Date.now(),
+    }
+    if (rule !== undefined && rule.kind === 'deny') {
+      task.status = 'rejected'
+      task.note = `命中黑名单（人=${rule.person} 事=${rule.matter}）自动拒绝`
+    } else if (rule !== undefined && rule.kind === 'allow') {
+      task.status = 'approved'
+      task.note = `命中白名单（人=${rule.person} 事=${rule.matter}）记忆授权`
+    }
+    const tasks = this.tasksOf(roomId)
+    tasks.push(task)
+    // 超限保护：拒绝最早的 pending。
+    const max = this.config.taskQueueMax
+    const pending = tasks.filter((t) => t.status === 'pending')
+    if (pending.length > max) {
+      const drop = pending[0]
+      if (drop !== undefined) {
+        drop.status = 'rejected'
+        drop.note = `队列超限（>${max}）自动拒绝`
+      }
+    }
+    this.persistTasks(roomId)
+
+    if (task.status === 'rejected') {
+      await this.safeSend(roomId, `🚫 任务已被拒绝：${task.note}\n${task.text}`, undefined)
+      return
+    }
+    if (task.status === 'approved') {
+      // 白名单命中：直接执行（仍受串行约束）。
+      await this.executeTask(roomId, task)
+      return
+    }
+    await this.safeSend(
+      roomId,
+      `📥 新任务已入队（待审）：\n来自 ${sender}：${text}\n发送 /tasks 查看，/approve N 执行。`,
+      undefined,
+    )
+  }
+
+  /** 粗粒度"事"分类：取消息首个有意义关键词（后续可接 LLM 分类）。 */
+  private classifyMatter(text: string): string {
+    const trimmed = text.trim()
+    if (trimmed === '') return '*'
+    // 取前 16 字作为事类别占位（人+事维度下"事"用关键词指代）。
+    return trimmed.slice(0, 16)
+  }
+
+  /**
+   * 执行一条已批准任务：先确保工作目录已设定（新房间引导），再创建会话注入。
+   * 同一房间串行：runningTask 占用时排队等待 turn/end 释放。
+   */
+  private async executeTask(roomId: string, task: MatrixTask): Promise<void> {
+    // 新房间（未绑定 cwd）先引导选目录。
+    if (this.state.roomCwd(roomId) === undefined) {
+      const candidates = await this.cwdCandidatesFor(roomId)
+      this.cwdPending.set(roomId, { candidates, taskId: task.id })
+      task.status = 'pending'
+      task.note = '等待设定工作目录'
+      this.persistTasks(roomId)
+      await this.safeSend(roomId, formatCwdGuide(candidates), markdownToHtml(formatCwdGuide(candidates)))
+      return
+    }
+    // 串行：若已有 running 任务，标记 approved 等 turn/end 消费。
+    if (this.runningTask.get(roomId) !== undefined) {
+      task.status = 'approved'
+      task.note = '已批准，等待前序任务完成'
+      this.persistTasks(roomId)
+      await this.pushTasks(roomId)
+      return
+    }
+    task.status = 'approved'
+    this.runningTask.set(roomId, task.id)
+    this.persistTasks(roomId)
+    const ctxPrompt = task.contextPrompt !== undefined ? `${task.contextPrompt}\n\n${task.text}` : task.text
+    await this.deliver(roomId, ctxPrompt, task.sender)
+    await this.pushTasks(roomId)
+  }
+
+  /** 候选工作目录：内核 workspaceRegistry 已登记的工作区 + 配置候选。 */
+  private async cwdCandidatesFor(roomId: string): Promise<string[]> {
+    const fromConfig = this.config.cwdCandidates.filter((c) => c !== undefined && c !== '')
+    const fromRegistry: string[] = []
+    try {
+      const registry = this.ctx.get('workspaceRegistry') as
+        | { list?: () => { path: string }[] }
+        | undefined
+      if (registry?.list !== undefined) {
+        for (const ws of registry.list()) fromRegistry.push(ws.path)
+      }
+    } catch {
+      /* 内核未提供 workspaceRegistry 时仅用配置候选 */
+    }
+    const set = new Set<string>([...fromRegistry, ...fromConfig, process.cwd()])
+    return [...set]
+  }
+
+  /** turn/end 后把当前 running 任务标完成，并消费下一条 approved 任务（严格串行）。 */
+  private async consumeNextTask(roomId: string): Promise<void> {
+    const runningId = this.runningTask.get(roomId)
+    if (runningId !== undefined) {
+      const t = this.findTask(roomId, runningId)
+      if (t !== undefined) {
+        t.status = 'done'
+        this.persistTasks(roomId)
+      }
+    }
+    this.runningTask.delete(roomId)
+    const next = this.tasksOf(roomId).find((t) => t.status === 'approved')
+    if (next !== undefined) await this.executeTask(roomId, next)
   }
 
   /** ---------- 命令 ---------- */
@@ -637,6 +935,67 @@ export class AccountBridge {
         }
         break
       }
+      case '/tasks':
+      case '/queue':
+        await this.pushTasks(roomId)
+        break
+      case '/approve': {
+        if (arg === '') {
+          await reply('用法：`/approve <N>`（N 为 /tasks 列表中的序号）')
+          break
+        }
+        const n = Number.parseInt(arg, 10)
+        const tasks = this.tasksOf(roomId)
+        const pending = tasks.filter((t) => t.status === 'pending')
+        if (!Number.isInteger(n) || n < 1 || n > pending.length) {
+          await reply(`❌ 序号无效，当前待审 ${pending.length} 条（/tasks 查看）。`)
+          break
+        }
+        const task = pending[n - 1]
+        if (task === undefined) break
+        await this.executeTask(roomId, task)
+        break
+      }
+      case '/reject': {
+        if (arg === '') {
+          await reply('用法：`/reject <N>`')
+          break
+        }
+        const n = Number.parseInt(arg, 10)
+        const pending = this.tasksOf(roomId).filter((t) => t.status === 'pending')
+        if (!Number.isInteger(n) || n < 1 || n > pending.length) {
+          await reply(`❌ 序号无效，当前待审 ${pending.length} 条。`)
+          break
+        }
+        const task = pending[n - 1]
+        if (task === undefined) break
+        task.status = 'rejected'
+        task.note = `Owner 拒绝（${sender}）`
+        this.persistTasks(roomId)
+        await reply(`🚫 已拒绝第 ${n} 条任务。`)
+        await this.pushTasks(roomId)
+        break
+      }
+      case '/allow':
+      case '/deny': {
+        const [person, ...matterParts] = arg.split(/\s+/)
+        const matter = matterParts.join(' ').trim() || '*'
+        if (person === undefined || person === '') {
+          await reply('用法：`/allow <人> <事>` 或 `/deny <人> <事>`（人/事可填 * 通配）')
+          break
+        }
+        this.state.addRule({
+          person,
+          matter,
+          kind: command === '/allow' ? 'allow' : 'deny',
+          addedAt: Date.now(),
+        })
+        await reply(`✅ 已添加${command === '/allow' ? '白' : '黑'}名单：人=${person} 事=${matter}`)
+        break
+      }
+      case '/rules':
+        await reply(formatRules(this.state.listRules()))
+        break
       default:
         await reply(`未知命令 \`${command ?? ''}\`，发送 /help 查看帮助。`)
     }
@@ -668,6 +1027,8 @@ export class AccountBridge {
           if (key.startsWith(`${roomId}:`)) this.toolNames.delete(key)
         }
         this.retryCounts.delete(roomId)
+        // 串行消费：前序任务结束后，执行下一条已批准任务（若有）。
+        void this.consumeNextTask(roomId)
         break
       }
       case 'tool/call': {

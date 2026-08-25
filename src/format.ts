@@ -261,3 +261,76 @@ export function describeMedia(media: readonly MediaLike[]): string {
   })
   return '\n' + parts.join(' ')
 }
+
+// ===================== Matrix 任务面板渲染 =====================
+
+import type { MatrixTask, AllowDenyRule } from './store.js'
+
+const TASK_STATUS_LABEL: Record<MatrixTask['status'], string> = {
+  pending: '⏳ 待审',
+  approved: '✅ 已批准',
+  rejected: '🚫 已拒绝',
+  done: '🏁 已完成',
+}
+
+/** 工作目录状态文案。 */
+export type WorkspaceState = 'none' | 'bound' | 'missing'
+
+export function formatWorkspaceState(state: WorkspaceState, cwd?: string): string {
+  switch (state) {
+    case 'none':
+      return '🆕 新来的（尚未设定工作目录）'
+    case 'bound':
+      return `📁 已有工作区：${cwd ?? ''}`
+    case 'missing':
+      return `⚠️ 工作目录不存在：${cwd ?? ''}`
+  }
+}
+
+/**
+ * 渲染房间 matrix 任务面板（纯文本，全 Matrix 客户端兼容）。
+ * 列出待办/已办计数、每条序号+状态+发起人+摘要，以及工作目录状态。
+ */
+export function formatTasks(
+  tasks: readonly MatrixTask[],
+  workspace: { state: WorkspaceState; cwd?: string },
+): string {
+  const lines: string[] = []
+  const pending = tasks.filter((t) => t.status === 'pending').length
+  const doneCount = tasks.filter((t) => t.status === 'done' || t.status === 'rejected').length
+  lines.push(`📋 任务面板（待审 ${pending} / 已办 ${doneCount} / 共 ${tasks.length}）`)
+  lines.push(formatWorkspaceState(workspace.state, workspace.cwd))
+  if (tasks.length === 0) {
+    lines.push('（暂无任务）')
+    return lines.join('\n')
+  }
+  tasks.forEach((t, i) => {
+    const who = t.sender
+    const snippet = t.text.length > 60 ? `${t.text.slice(0, 60)}…` : t.text
+    const note = t.note ? ` · ${t.note}` : ''
+    lines.push(`${i + 1}. ${TASK_STATUS_LABEL[t.status]} ${who}：${snippet}${note}`)
+  })
+  lines.push('')
+  lines.push('命令：/queue 刷新 · /approve N 执行 · /reject N 拒绝 · /allow 人 事 / /deny 人 事')
+  return lines.join('\n')
+}
+
+/** 渲染工作目录候选引导（文本编号）。 */
+export function formatCwdGuide(candidates: readonly string[]): string {
+  const lines: string[] = ['📁 请为这个会话选择工作目录（回复编号）：']
+  candidates.forEach((c, i) => lines.push(`  ${i + 1}. ${c}`))
+  lines.push('')
+  lines.push('回复编号即选定；选定后该房间的任务才能执行。')
+  return lines.join('\n')
+}
+
+/** 渲染黑白名单列表。 */
+export function formatRules(rules: readonly AllowDenyRule[]): string {
+  if (rules.length === 0) return '（暂无黑白名单规则）'
+  const lines = ['📑 人+事 黑白名单：']
+  rules.forEach((r, i) => {
+    const kind = r.kind === 'allow' ? '✅白' : '🚫黑'
+    lines.push(`${i + 1}. [${kind}] 人=${r.person} 事=${r.matter}`)
+  })
+  return lines.join('\n')
+}
