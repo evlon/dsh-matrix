@@ -185,6 +185,11 @@ function localpartOf(mxid: string): string {
   return at > 0 ? mxid.slice(1, at) : mxid.slice(1)
 }
 
+/** 转义正则特殊字符，用于把 localpart 安全嵌入正则。 */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 /** 稳定短哈希（FNV-1a 32bit → 8 位 hex），用于确定性会话 id。 */
 function stableHash(input: string): string {
   let h = 0x811c9dc5
@@ -356,9 +361,18 @@ export class AccountBridge {
    */
   private async shouldRespond(message: InboundMessage): Promise<boolean> {
     const lower = message.text.toLowerCase()
-    const mentioned = this.allAccountIds.filter((id) =>
-      lower.includes(`@${localpartOf(id).toLowerCase()}`) || lower.includes(id.toLowerCase()),
-    )
+    // 提及识别兼容三种 Matrix 渲染格式：
+    //  1) '@名字'（Element 常见）
+    //  2) '@名字:域名' 完整 ID
+    //  3) '名字:' / '名字：'（部分客户端/桥接把 @提及 渲染为 "名字: 内容"，无 @ 无域名）
+    const mentioned = this.allAccountIds.filter((id) => {
+      const lp = localpartOf(id).toLowerCase()
+      return (
+        lower.includes(`@${lp}`) ||
+        lower.includes(id.toLowerCase()) ||
+        new RegExp(`(^|\\s)${escapeRegExp(lp)}[:：]`).test(lower)
+      )
+    })
     const isDm = this.channel.isDirectRoom ? await this.channel.isDirectRoom(message.roomId) : false
     // 诊断日志：每次门控决策都打印关键因子，便于事后从 diagnostics.log 排查"为何响应/静默"。
     this.diag.log(`shouldRespond room=${message.roomId} account=${this.userId} isMain=${this.isMain} respondToAll=${this.respondToAll} isDm=${isDm} mentioned=${mentioned.length > 0 ? mentioned.join(',') : '(none)'} text=${message.text.slice(0, 60).replace(/\n/g, ' ')}`)
@@ -598,7 +612,11 @@ export class AccountBridge {
       // 仅去除本插件已知账号的提及，避免误删命令参数里的人名（如 /deny @alice:hs.example 机密）。
       let stripped = text
       for (const id of this.allAccountIds) {
-        stripped = stripped.replace(id, '').replace(`@${localpartOf(id)}`, '')
+        const lp = localpartOf(id)
+        stripped = stripped
+          .replace(id, '')
+          .replace(`@${lp}`, '')
+          .replace(new RegExp(`(^|\\s)${escapeRegExp(lp)}[:：]`), '')
       }
       stripped = stripped.replace(/\s+/g, ' ').trim()
 

@@ -180,6 +180,12 @@ test('bridge end-to-end: merge, assistant delivery, approval, commands, dedup, s
     await new Promise((resolve) => setTimeout(resolve, 100))
     assert.equal(captured.messages.length, 1)
 
+    // 3.5) 提及渲染格式 '名字:'（无 @ 无域名，部分客户端/桥接的 @提及 正文形态）也应触发响应
+    hs.deliver([textEvent('$e3', 'bot: 你好!!')])
+    await waitFor(() => captured.messages.length === 2)
+    const mentioned = captured.messages[1]
+    assert.match(mentioned.content[0].text, /\n【当前消息】\n你好$/)
+
     // 4) 审批
     const req = { agent: { id: agentId }, toolName: 'bash', reason: '跑命令', signal: undefined }
     const outcomePromise = captured.approvalHandler(req, async () => 'unavailable')
