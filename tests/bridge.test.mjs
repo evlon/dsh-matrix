@@ -146,8 +146,8 @@ test('bridge end-to-end: merge, assistant delivery, approval, commands, dedup, s
     await waitFor(() => captured.messages.length === 1)
     const merged = captured.messages[0]
     assert.equal(merged.content[0].text, '你好\n世界')
-    assert.equal(merged.source.kind, 'plugin')
-    assert.equal(merged.source.plugin, 'dsh-matrix')
+    assert.equal(merged.source.kind, 'user')
+    assert.equal(merged.source.sender, SENDER)
     const agentId = captured.agents[0].agent.id
 
     // 2) 出站：markdown 子集 HTML

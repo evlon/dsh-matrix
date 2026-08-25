@@ -42,6 +42,7 @@ const HELP_TEXT = [
 
 interface MergeBuffer {
   parts: string[]
+  sender?: string
   timer?: NodeJS.Timeout
 }
 
@@ -308,7 +309,7 @@ export class AccountBridge {
         rest = text.slice(0, -2).trim()
       }
       if (rest === '') return
-      const buffer = this.mergeBuffers.get(message.roomId) ?? { parts: [] }
+      const buffer = this.mergeBuffers.get(message.roomId) ?? { parts: [], sender: message.sender }
       if (buffer.timer !== undefined) clearTimeout(buffer.timer)
       buffer.parts.push(rest)
       buffer.timer = setTimeout(() => {
@@ -328,14 +329,24 @@ export class AccountBridge {
     if (buffer.timer !== undefined) clearTimeout(buffer.timer)
     const text = buffer.parts.join('\n').trim()
     if (text === '') return
-    void this.deliver(roomId, text)
+    void this.deliver(roomId, text, buffer.sender)
   }
 
-  private async deliver(roomId: string, text: string): Promise<void> {
+  /**
+   * 把房间消息注入 agent 会话。
+   * source.kind 用 'user'（而非 'plugin'）：Harness GUI 对 user/message 事件按
+   * source.kind 分类——'plugin' 会被渲染成"上下文"而非用户输入气泡，导致
+   * Matrix 里看到的输入在 GUI 历史中不可见。'user' 让输入在两边一致可见。
+   * sender 一并带上，多人群聊时 GUI 历史可区分说话人。
+   */
+  private async deliver(roomId: string, text: string, sender?: string): Promise<void> {
     const agent = await this.getRoomAgent(roomId)
     agent.followup(createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'dsh-matrix' },
+      source: {
+        kind: 'user',
+        ...(sender !== undefined ? { sender } : {}),
+      },
     }))
   }
 
