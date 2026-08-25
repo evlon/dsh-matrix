@@ -96,8 +96,8 @@ function makeCtx() {
           captured.agents.push(handle)
           return handle
         },
-        async resume({ sessionId }) {
-          const agent = { id: sessionId, status: 'idle', session: { id: sessionId }, followup(message) { captured.messages.push(message) } }
+        async resume({ resumeSessionId }) {
+          const agent = { id: resumeSessionId, status: 'idle', session: { id: resumeSessionId }, followup(message) { captured.messages.push(message) } }
           const handle = { agent, async dispose() {} }
           captured.agents.push(handle)
           return handle
@@ -155,87 +155,92 @@ test('matrix tasks: enqueue, cwd guide, approve, serial, reject, allow/deny', as
     await startPromise
 
     // 1) 同事消息进队列（不直接执行）
-    hs.deliver([textEvent('$m1', SENDER, '帮我画一张图')])
+    hs.deliver([textEvent('$m1', SENDER, '@bot 帮我画一张图')])
     await waitFor(() => hs.sends.some((s) => s.body.body !== undefined && s.body.body.includes('📥 新任务已入队')))
     assert.equal(captured.messages.length, 0, '数字分身模式下消息不应直接注入会话')
 
     // 2) /tasks 应显示 1 条待审
     hs.sends.length = 0
-    hs.deliver([textEvent('$c1', OWNER, '/tasks')])
+    hs.deliver([textEvent('$c1', OWNER, '@bot /tasks')])
     await waitFor(() => lastTaskPanel(hs.sends) !== undefined)
     assert.ok(lastTaskPanel(hs.sends).includes('待审 1'))
 
     // 3) /approve 无 cwd -> 弹工作目录引导
     hs.sends.length = 0
-    hs.deliver([textEvent('$c2', OWNER, '/approve 1')])
+    hs.deliver([textEvent('$c2', OWNER, '@bot /approve 1')])
     await waitFor(() => hs.sends.some((s) => s.body.body !== undefined && s.body.body.includes('请为这个会话选择工作目录')))
     assert.ok(hs.sends.some((s) => s.body.body.includes('1. /work/a')))
 
-    // 4) 回复编号选目录 -> cwd 设定并任务执行
+    // 4) 回复编号选目录 -> cwd 设定并任务执行（编号回复无需 @提及，cwdPending 门控在前）
     hs.sends.length = 0
     hs.deliver([textEvent('$c3', OWNER, '1')])
     await waitFor(() => captured.messages.length === 1)
-    assert.match(captured.messages[0].content[0].text, /^\[群聊，你是@bot\]\n帮我画一张图$/)
+    // 注入格式：群聊标签 + 最近对话上下文块 + 当前消息（已剥离 @提及；历史含原始提及与命令，不逐一钉死）
+    const injected0 = captured.messages[0].content[0].text
+    assert.match(injected0, /^\[群聊，你是@bot\]\n【本群最近对话（未 @你 的你也可能需要的上下文）】\n- @alice:hs\.example: @bot 帮我画一张图\n/)
+    assert.match(injected0, /\n【当前消息】\n帮我画一张图$/)
     assert.equal(captured.messages[0].source.sender, SENDER)
     // 任务一执行完（模拟 turn/end）释放 runningTask
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
 
     // 5) 串行：再入两条，逐条批准（每次 approve 第 1 条待审），前一条 turn/end 后下一条才执行
-    hs.deliver([textEvent('$m2', SENDER, '任务二'), textEvent('$m3', SENDER, '任务三')])
+    hs.deliver([textEvent('$m2', SENDER, '@bot 任务二'), textEvent('$m3', SENDER, '@bot 任务三')])
     await waitFor(() => hs.sends.some((s) => s.body.body !== undefined && s.body.body.includes('📥 新任务已入队')))
     hs.sends.length = 0
-    hs.deliver([textEvent('$c4', OWNER, '/approve 1')]) // 第1条待审=任务二
+    hs.deliver([textEvent('$c4', OWNER, '@bot /approve 1')]) // 第1条待审=任务二
     await waitFor(() => captured.messages.length === 2)
-    assert.match(captured.messages[1].content[0].text, /^\[群聊，你是@bot\]\n任务二$/)
+    // 任务二：宽松断言（上下文块含之前的命令与任务，不钉死）
+    assert.match(captured.messages[1].content[0].text, /^\[群聊，你是@bot\]\n【本群最近对话（未 @你 的你也可能需要的上下文）】/)
+    assert.match(captured.messages[1].content[0].text, /\n【当前消息】\n任务二$/)
     // 任务二 turn 结束 -> 释放，任务三变为第1条待审
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
     hs.sends.length = 0
-    hs.deliver([textEvent('$c5', OWNER, '/approve 1')]) // 现在第1条=任务三
+    hs.deliver([textEvent('$c5', OWNER, '@bot /approve 1')]) // 现在第1条=任务三
     await waitFor(() => captured.messages.length === 3)
-    assert.match(captured.messages[2].content[0].text, /^\[群聊，你是@bot\]\n任务三$/)
+    assert.match(captured.messages[2].content[0].text, /\n【当前消息】\n任务三$/)
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
 
     // 6) 串行约束：running 时 approve 的新任务应排队等待 turn/end
-    hs.deliver([textEvent('$m7', SENDER, '任务四')])
+    hs.deliver([textEvent('$m7', SENDER, '@bot 任务四')])
     await waitFor(() => hs.sends.some((s) => s.body.body.includes('📥 新任务已入队')))
     hs.sends.length = 0
-    hs.deliver([textEvent('$c9', OWNER, '/approve 1')]) // 任务四立即执行（当前无 running）
+    hs.deliver([textEvent('$c9', OWNER, '@bot /approve 1')]) // 任务四立即执行（当前无 running）
     await waitFor(() => captured.messages.length === 4)
-    assert.match(captured.messages[3].content[0].text, /^\[群聊，你是@bot\]\n任务四$/)
+    assert.match(captured.messages[3].content[0].text, /\n【当前消息】\n任务四$/)
     // 此时任务四 running，再入任务五并 approve，应排队（不立即执行）
-    hs.deliver([textEvent('$m8', SENDER, '任务五')])
+    hs.deliver([textEvent('$m8', SENDER, '@bot 任务五')])
     await waitFor(() => hs.sends.some((s) => s.body.body.includes('📥 新任务已入队')))
     hs.sends.length = 0
-    hs.deliver([textEvent('$c10', OWNER, '/approve 1')])
+    hs.deliver([textEvent('$c10', OWNER, '@bot /approve 1')])
     await waitFor(() => lastTaskPanel(hs.sends) !== undefined && lastTaskPanel(hs.sends).includes('已批准'))
     assert.equal(captured.messages.length, 4, '任务五应在任务四 turn/end 后才执行（串行）')
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
     await waitFor(() => captured.messages.length === 5)
-    assert.match(captured.messages[4].content[0].text, /^\[群聊，你是@bot\]\n任务五$/)
+    assert.match(captured.messages[4].content[0].text, /\n【当前消息】\n任务五$/)
     // 任务五自身 turn 结束 -> 释放 runningTask
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
 
     // 7) 黑名单：加 deny 规则后新消息自动拒绝
     hs.sends.length = 0
-    hs.deliver([textEvent('$c6', OWNER, '/deny ' + SENDER + ' 机密')])
+    hs.deliver([textEvent('$c6', OWNER, '@bot /deny ' + SENDER + ' 机密')])
     await waitFor(() => hs.sends.some((s) => s.body.body.includes('已添加黑')))
-    hs.deliver([textEvent('$m4', SENDER, '机密：xxxx')])
+    hs.deliver([textEvent('$m4', SENDER, '@bot 机密：xxxx')])
     await waitFor(() => hs.sends.some((s) => s.body.body !== undefined && s.body.body.includes('🚫 任务已被拒绝')))
     assert.ok(hs.sends.some((s) => s.body.body.includes('命中黑名单')))
 
     // 8) 白名单：加 allow 后命中自动批准执行
     hs.sends.length = 0
-    hs.deliver([textEvent('$c7', OWNER, '/allow ' + SENDER + ' 日报')])
+    hs.deliver([textEvent('$c7', OWNER, '@bot /allow ' + SENDER + ' 日报')])
     await waitFor(() => hs.sends.some((s) => s.body.body.includes('已添加白')))
-    hs.deliver([textEvent('$m5', SENDER, '日报：今日进展')])
+    hs.deliver([textEvent('$m5', SENDER, '@bot 日报：今日进展')])
     await waitFor(() => captured.messages.length === 6)
-    assert.match(captured.messages[5].content[0].text, /^\[群聊，你是@bot\]\n日报：今日进展$/)
+    assert.match(captured.messages[5].content[0].text, /\n【当前消息】\n日报：今日进展$/)
 
     // 9) /reject 拒绝待审（新任务即第 1 条待审）
-    hs.deliver([textEvent('$m6', SENDER, '另一个任务')])
+    hs.deliver([textEvent('$m6', SENDER, '@bot 另一个任务')])
     await waitFor(() => hs.sends.some((s) => s.body.body.includes('📥 新任务已入队')))
     hs.sends.length = 0
-    hs.deliver([textEvent('$c8', OWNER, '/reject 1')])
+    hs.deliver([textEvent('$c8', OWNER, '@bot /reject 1')])
     await waitFor(() => hs.sends.some((s) => s.body.body.includes('🚫 已拒绝第')))
     assert.ok(hs.sends.some((s) => s.body.body.includes('已拒绝第 1')))
 

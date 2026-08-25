@@ -22,6 +22,8 @@ import { chunkText, markdownToHtml, formatToolCall, describeMedia, wantsProcess,
 import type { Verbosity, WorkspaceState } from './format.js'
 import { MatrixChannel } from './matrix.js'
 import type { Channel, InboundMessage } from './matrix.js'
+import { getDiag } from './diag.js'
+import { ChatLog } from './chatlog.js'
 import { BridgeState } from './store.js'
 import type { MatrixTask, AllowDenyRule } from './store.js'
 import { AuthStore } from './auth-store.js'
@@ -209,6 +211,10 @@ export class AccountBridge {
   private readonly authStore: AuthStore
   private readonly channel: Channel
   private readonly allAccountIds: readonly string[]
+  /** 诊断日志：写入 stateDir/diagnostics.log，供事后文件排查（无需运行终端）。 */
+  private readonly diag: ReturnType<typeof getDiag>
+  /** 近期聊天记录（按房间，最近一周）：与响应门控解耦，无论是否 @都记录，供 @时被引用。 */
+  private readonly chatlog: ChatLog
   /** 共享的「房间内有 pending 审批」集合（MatrixBridge 传入，多账号协调审批应答）。 */
   private readonly pendingRooms: Set<string>
 
@@ -264,10 +270,12 @@ export class AccountBridge {
     this.authStore = authStore
     this.allAccountIds = allAccountIds
     this.pendingRooms = pendingRooms
+    this.diag = getDiag('dsh-matrix', config.stateDir)
+    this.chatlog = new ChatLog(config.stateDir)
 
     this.userId = account.userId
     this.isMain = account.userId === config.userId
-    this.owner = account.owner !== '' ? account.owner : undefined
+    this.owner = account.owner !== '' ? account.owner : (this.isMain ? config.owner : undefined)
     // 响应策略：显式 respondToAll 优先；主账号兜底 true（旧行为）。
     this.respondToAll = account.respondToAll || this.isMain
     this.agentOptions = {
@@ -342,23 +350,31 @@ export class AccountBridge {
    * 消息路由（多账号协作语义）：
    * 1. 若消息 @提及 了任一已知账号（主账号或分身），则只有被 @提及 的账号响应，
    *    其余账号（含主账号）一律静默，避免抢答别人/别的数字人的对话；
-   * 2. 无任何 @提及 时：私聊（≤2 人房间）始终响应；群聊里仅主账号（个人助手模式）
-   *    兜底响应全部，分身必须被显式 @提及 才响应，绝不抢答未指名给自己的群消息。
-   * 命令同样遵循该规则；审批应答不受此门控限制（在 handleMessage 中先行处理）。
+   * 2. 无任何 @提及 时：私聊（≤2 人房间）始终响应；群聊里一律静默——无论 isMain 还是
+   *    respondToAll，都不响应未指名给自己的群消息（避免浪费 token、避免抢答别人的对话）。
+   *    分身在群里必须被显式 @提及 才响应。命令同样遵循该规则；审批应答不受此门控限制。
    */
   private async shouldRespond(message: InboundMessage): Promise<boolean> {
     const lower = message.text.toLowerCase()
     const mentioned = this.allAccountIds.filter((id) =>
       lower.includes(`@${localpartOf(id).toLowerCase()}`) || lower.includes(id.toLowerCase()),
     )
+    const isDm = this.channel.isDirectRoom ? await this.channel.isDirectRoom(message.roomId) : false
+    // 诊断日志：每次门控决策都打印关键因子，便于事后从 diagnostics.log 排查"为何响应/静默"。
+    this.diag.log(`shouldRespond room=${message.roomId} account=${this.userId} isMain=${this.isMain} respondToAll=${this.respondToAll} isDm=${isDm} mentioned=${mentioned.length > 0 ? mentioned.join(',') : '(none)'} text=${message.text.slice(0, 60).replace(/\n/g, ' ')}`)
     // 消息 @提及了某个已知账号：只有被 @的账号响应，其余全部静默（含主账号）。
     if (mentioned.length > 0) {
-      return mentioned.includes(this.userId)
+      const ok = mentioned.includes(this.userId)
+      this.diag.log(`  -> mentioned-branch: respond=${ok} (${ok ? 'self' : 'other'} mentioned)`)
+      return ok
     }
     // 无人被 @提及：私聊始终响应。
-    if (this.channel.isDirectRoom && await this.channel.isDirectRoom(message.roomId)) return true
-    // 群聊：仅主账号（个人助手模式）兜底响应全部；分身必须被 @提及 才响应。
-    if (this.isMain && this.respondToAll) return true
+    if (isDm) {
+      this.diag.log('  -> dm-branch: respond=true')
+      return true
+    }
+    // 群聊：一律静默。分身/主账号都必须被显式 @提及 才响应，避免浪费 token 与抢答。
+    this.diag.log('  -> group-silent-branch: respond=false')
     return false
   }
 
@@ -649,6 +665,11 @@ export class AccountBridge {
         return
       }
 
+      this.diag.log(`handleMessage room=${message.roomId} from=${message.sender} digitalTwinMode=${this.config.digitalTwinMode} text=${text.slice(0, 60).replace(/\n/g, ' ')}`)
+      // 记录近期聊天（与响应门控解耦：无论是否 @都存，供被人 @ 时回溯上下文）。
+      if (text.trim().length > 0) {
+        this.chatlog.append(message.roomId, { ts: Date.now(), sender: message.sender, text })
+      }
       if (!(await this.shouldRespond(message))) return
 
       if (stripped.startsWith('/')) {
@@ -659,19 +680,21 @@ export class AccountBridge {
 
       // 数字分身模式：同事/主管发来的工作进 matrix 任务队列待审，不直接执行。
       // 机器人自己账号发出的消息（如有）不进队列；命令已在上方处理。
+      // 入队用 stripped（已剥 @提及 前缀）：任务面板与注入 agent 的文本不带原始提及标记。
       if (this.config.digitalTwinMode && message.sender !== this.userId) {
-        await this.enqueueTask(message.roomId, message.sender, message.text)
+        await this.enqueueTask(message.roomId, message.sender, stripped)
         return
       }
 
       // 合并窗口：'..' 继续、'!!' 立即提交、裸文本等待 mergeTimeoutSecs。
-      let rest = text
+      // 用 stripped（已剥 @提及 前缀）：注入 agent 的提示词不带原始提及标记。
+      let rest = stripped
       let flush = false
-      if (text.endsWith('!!')) {
-        rest = text.slice(0, -2).trim()
+      if (stripped.endsWith('!!')) {
+        rest = stripped.slice(0, -2).trim()
         flush = true
-      } else if (text.endsWith('..')) {
-        rest = text.slice(0, -2).trim()
+      } else if (stripped.endsWith('..')) {
+        rest = stripped.slice(0, -2).trim()
       }
       if (rest === '') return
       const buffer = this.mergeBuffers.get(message.roomId) ?? { parts: [], sender: message.sender }
@@ -721,16 +744,38 @@ export class AccountBridge {
     const count = this.channel.getRoomMemberCount ? await this.channel.getRoomMemberCount(roomId) : undefined
     const head = roomName !== undefined ? `群聊「${roomName}」` : '群聊'
     const size = count !== undefined ? `，约${count}人` : ''
-    return `[${head}${size}，你是${me}]`
+    const label = `[${head}${size}，你是${me}]`
+    this.diag.log(`roomContextLabel room=${roomId} isDm=${isDm} name=${roomName ?? '(none)'} count=${count ?? '(unknown)'} label=${label}`)
+    return label
+  }
+
+  /**
+   * 群聊最近一周的对话上下文（供分身被人 @ 时回溯/引用）。纯文本，按时间升序，
+   * 最多取最近 40 条，单条过长截断。返回空字符串表示无上下文。token 与群人数无关。
+   */
+  private groupChatContext(roomId: string, max = 40, maxLine = 200): string {
+    const recent = this.chatlog.recent(roomId, max)
+    if (recent.length === 0) return ''
+    const lines = recent.map((e) => {
+      const t = e.text.length > maxLine ? e.text.slice(0, maxLine) + '…' : e.text
+      return `- ${e.sender}: ${t}`
+    })
+    return `【本群最近对话（未 @你 的你也可能需要的上下文）】\n${lines.join('\n')}`
   }
 
   private async deliver(roomId: string, text: string, sender?: string): Promise<void> {
     const agent = await this.getRoomAgent(roomId)
     // 群聊上下文：群名+人数+身份一行前缀，避免 agent 误把群消息当私聊对话。
     const label = await this.roomContextLabel(roomId)
-    const prefixed = `${label}\n${text}`
+    let body = `${label}\n${text}`
+    // 群聊里：当本条是触发分身的消息时，附上最近一周对话上下文，便于引用前置消息。
+    const isDm = this.channel.isDirectRoom ? await this.channel.isDirectRoom(roomId) : false
+    if (!isDm) {
+      const ctx = this.groupChatContext(roomId)
+      if (ctx) body = `${label}\n${ctx}\n\n【当前消息】\n${text}`
+    }
     agent.followup(createUserMessage({
-      content: [{ type: 'text', text: prefixed }],
+      content: [{ type: 'text', text: body }],
       source: {
         kind: 'user',
         ...(sender !== undefined ? { sender } : {}),

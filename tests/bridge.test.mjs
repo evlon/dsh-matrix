@@ -109,8 +109,8 @@ function makeCtx() {
           captured.agents.push(handle)
           return handle
         },
-        async resume({ sessionId }) {
-          const agent = { id: sessionId, status: 'idle', session: { id: sessionId }, followup(message) { captured.messages.push(message) } }
+        async resume({ resumeSessionId }) {
+          const agent = { id: resumeSessionId, status: 'idle', session: { id: resumeSessionId }, followup(message) { captured.messages.push(message) } }
           const handle = { agent, async dispose() {} }
           captured.agents.push(handle)
           return handle
@@ -154,12 +154,12 @@ test('bridge end-to-end: merge, assistant delivery, approval, commands, dedup, s
     hs.deliver([])
     await startPromise
 
-    // 1) 合并窗口
-    hs.deliver([textEvent('$e1', '你好..'), textEvent('$e2', '世界!!')])
+    // 1) 合并窗口（群聊必须 @提及 bot 才响应；stripped 去掉 @bot 前缀后合并）
+    hs.deliver([textEvent('$e1', '@bot 你好..'), textEvent('$e2', '@bot 世界!!')])
     await waitFor(() => captured.messages.length === 1)
     const merged = captured.messages[0]
-    // 群聊上下文标签注入：房间名+人数+身份一行前缀（token 与群人数无关，不注入名单）。
-    assert.match(merged.content[0].text, /^\[群聊「测试群」，约3人，你是@bot\]\n你好\n世界$/)
+    // 群聊上下文标签 + 最近一周对话上下文 + 当前消息（合并后已剥离 @bot 前缀）。
+    assert.match(merged.content[0].text, /^\[群聊「测试群」，约3人，你是@bot\]\n【本群最近对话（未 @你 的你也可能需要的上下文）】\n- @alice:hs\.example: @bot 你好\.\.\n- @alice:hs\.example: @bot 世界!!\n\n【当前消息】\n你好\n世界$/)
     assert.equal(merged.source.kind, 'user')
     assert.equal(merged.source.sender, SENDER)
     const agentId = captured.agents[0].agent.id
@@ -187,8 +187,8 @@ test('bridge end-to-end: merge, assistant delivery, approval, commands, dedup, s
     hs.deliver([textEvent('$r1', '批准')])
     assert.equal(await outcomePromise, 'allowed-once')
 
-    // 5) /status
-    hs.deliver([textEvent('$c1', '/status')])
+    // 5) /status（群聊必须 @提及 bot 才响应）
+    hs.deliver([textEvent('$c1', '@bot /status')])
     await waitFor(() => hs.sends.some((s) => s.body.body !== undefined && s.body.body.includes('当前会话')))
 
     await bridge.stop()

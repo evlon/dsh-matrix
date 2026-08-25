@@ -104,13 +104,19 @@ function makeCtx() {
         })
       },
       agents: {
+        get() { return undefined },
         async create({ sessionId }) {
           const agent = { id: sessionId, status: 'idle', session: { id: sessionId }, followup(message) { captured.messages.push(message) } }
           const handle = { agent, async dispose() {} }
           captured.agents.push(handle)
           return handle
         },
-        async resume() { throw new Error('no persistence') },
+        async resume({ resumeSessionId }) {
+          const agent = { id: resumeSessionId, status: 'idle', session: { id: resumeSessionId }, followup(message) { captured.messages.push(message) } }
+          const handle = { agent, async dispose() {} }
+          captured.agents.push(handle)
+          return handle
+        },
       },
     },
   }
@@ -146,7 +152,6 @@ test('multi-account + owner auth: twin approval, auth commands, routing', async 
       stateDir: dir,
       fetchFn: hs.fetch,
       sleep: async () => {},
-      digitalTwinMode: true,
       digitalTwins: [
         {
           userId: TWIN_USER_ID,
@@ -159,6 +164,7 @@ test('multi-account + owner auth: twin approval, auth commands, routing', async 
           model: 'deepseek-v4-flash',
         },
       ],
+      owner: OWNER_ID,
     })
 
     // 双账号同步启动；deliver([]) 按账号数调用（每个账号各释放一次启动 sync）。
@@ -167,10 +173,12 @@ test('multi-account + owner auth: twin approval, auth commands, routing', async 
     hs.deliver([])
     await startPromise
 
-    // 1) 主账号响应裸文本（旧行为）；用 !! 立即提交，避免 5s 合并窗口拖慢测试
-    hs.deliver([textEvent('$m1', '你好!!')])
+    // 1) 群聊必须 @提及 才响应：主账号被 @ 后响应；用 !! 立即提交，避免 5s 合并窗口拖慢测试
+    hs.deliver([textEvent('$m1', '@bot-main 你好!!')])
     await waitFor(() => captured.messages.length === 1, 'main responds')
-    assert.equal(captured.messages[0].content[0].text, '你好')
+    // 注入格式：群聊标签 + 最近对话上下文（含本条原始消息）+ 当前消息（已剥 @提及）
+    assert.match(captured.messages[0].content[0].text,
+      /^\[群聊「数智化部全员群」，你是@bot-main\]\n【本群最近对话（未 @你 的你也可能需要的上下文）】\n- @alice:hs\.example: @bot-main 你好!!\n\n【当前消息】\n你好$/)
     captured.messages.length = 0
 
     // 1.5) 会话标题 = Matrix 房间名（rename 被调用且标题正确）
@@ -190,8 +198,9 @@ test('multi-account + owner auth: twin approval, auth commands, routing', async 
     const req = { agent: { id: twinAgentId }, toolName: 'bash', reason: 'run cmd', signal: undefined }
     const outcomePromise = captured.approvalHandler(req, async () => 'unavailable')
     await waitFor(() => hs.sends.some((s) => s.body.body?.includes('审批请求')), 'approval push')
-    const approval = hs.sends.find((s) => s.body.body?.includes('审批请求'))
-    assert.ok(approval.body.body.includes('仅 Owner @owner 可以应答'))
+    const approval = hs.sends.find((s) => s.body.body?.includes('仅 Owner @owner 可以应答。'))
+    assert.ok(approval, 'approval push should contain owner note')
+    assert.ok(approval.body.body.includes('仅 Owner @owner 可以应答。'))
 
     // 4) Owner 批准 → 记忆授权写库
     hs.deliver([textEvent('$a1', '批准', OWNER_ID)])
@@ -200,8 +209,10 @@ test('multi-account + owner auth: twin approval, auth commands, routing', async 
     // 5) /auth list 显示记忆授权（必须 @提及 分身，主账号不截胡）
     hs.deliver([textEvent('$l1', '@bot-twin:hs.example /auth list', OWNER_ID)])
     await waitFor(() => hs.sends.some((s) => s.body.body?.includes('记忆授权')), 'auth list')
-    const list = hs.sends.find((s) => s.body.body?.includes('记忆授权'))
-    assert.ok(list.body.body.includes('bash'))
+    // 找到分身的回复（含 @bot-twin）
+    const list = hs.sends.find((s) => s.body.body?.includes('记忆授权') && s.body.body.includes('@bot-twin'))
+    assert.ok(list, 'should find twin auth list reply')
+    assert.ok(list.body.body.includes('`bash`'), 'bash should be in allowed tools list')
 
     // 6) 非 Owner（SENDER）@提及分身尝试吊销 → 拒绝
     hs.deliver([textEvent('$r1', '@bot-twin:hs.example /auth revoke bash', SENDER)])
