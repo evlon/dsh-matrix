@@ -17,7 +17,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import type { Config, DigitalTwinAccount } from './config.js'
-import { chunkText, markdownToHtml, formatToolCall, describeMedia, wantsProcess, formatToolResult, formatTurnEnd, formatRetry } from './format.js'
+import { chunkText, markdownToHtml, formatToolCall, describeMedia, wantsProcess, formatToolResult, formatTurnEnd, formatRetry, formatRetryCircuitTripped } from './format.js'
 import type { Verbosity } from './format.js'
 import { MatrixChannel } from './matrix.js'
 import type { Channel, InboundMessage } from './matrix.js'
@@ -216,6 +216,12 @@ export class AccountBridge {
    * 时切到 'process'（过程党）。per-room 独立，不在房间间共享。
    */
   private readonly roomVerbosity = new Map<string, Verbosity>()
+  /**
+   * 重试熔断计数：按房间累计当前 turn 内 LLM 受限重试次数（取 llm/retry.retry 序号）。
+   * 达 config.maxRetriesBeforeAbort 时主动 agent.cancel() 终止 turn 止损。
+   * turn/end 时随 toolNames 一并清理，避免内存增长。
+   */
+  private readonly retryCounts = new Map<string, number>()
 
   constructor(
     ctx: Context,
@@ -426,6 +432,7 @@ export class AccountBridge {
     }
     this.toolNames.delete(roomId)
     this.roomVerbosity.delete(roomId)
+    this.retryCounts.delete(roomId)
   }
 
   /** ---------- 入站消息 ---------- */
@@ -660,6 +667,7 @@ export class AccountBridge {
         for (const key of this.toolNames.keys()) {
           if (key.startsWith(`${roomId}:`)) this.toolNames.delete(key)
         }
+        this.retryCounts.delete(roomId)
         break
       }
       case 'tool/call': {
@@ -689,14 +697,38 @@ export class AccountBridge {
         break
       }
       case 'llm/retry': {
-        if (verbosity !== 'process') break
-        const retry = formatRetry({
-          retry: data.retry ?? 1,
-          maxRetries: data.maxRetries,
-          delayMs: data.delayMs ?? 0,
-          failure: data.failure,
-        })
-        void this.safeSend(roomId, retry, undefined)
+        const retry = data.retry ?? 1
+        const isUnbounded = data.maxRetries === undefined
+        const failureMsg = data.failure?.message
+        // 诊断：始终记录 retry 来源（mode/次数/原因），便于事后复盘 token 消耗。
+        this.ctx.logger.info(
+          '[dsh-matrix] llm/retry room=%s retry=%d mode=%s%s',
+          roomId,
+          retry,
+          isUnbounded ? 'always(无上限)' : `normal(上限${data.maxRetries})`,
+          failureMsg ? ` reason=${failureMsg}` : '',
+        )
+        // 过程模式：展示完整重试提示（含 always 无上限警示）。
+        if (verbosity === 'process') {
+          void this.safeSend(
+            roomId,
+            formatRetry({ retry, maxRetries: data.maxRetries, delayMs: data.delayMs ?? 0, failure: data.failure }),
+            undefined,
+          )
+        }
+        // 熔断：累计重试次数达阈值即主动终止 turn 止损（harness always 模式会无限烧 token）。
+        const threshold = this.config.maxRetriesBeforeAbort
+        if (this.config.retryCircuitBreakerEnabled && threshold > 0 && retry >= threshold) {
+          const handle = this.roomAgents.get(roomId)
+          if (handle !== undefined && handle.agent.status === 'running') {
+            this.ctx.logger.warn('[dsh-matrix] retry circuit breaker tripped room=%s retry=%d>=%d', roomId, retry, threshold)
+            handle.agent.cancel({ kind: 'hook', reason: `dsh-matrix: retry circuit breaker at ${retry}/${threshold}` })
+            void this.safeSend(roomId, formatRetryCircuitTripped(retry, threshold), undefined)
+          }
+          // cancel 后 turn/end 会触发并清理 retryCounts；此处不再累加避免重复触发。
+          break
+        }
+        this.retryCounts.set(roomId, retry)
         break
       }
       case 'assistant/message': {

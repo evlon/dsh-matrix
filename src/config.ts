@@ -55,6 +55,14 @@ export interface Config {
   approvalTimeoutSecs: number
   /** 桥接状态文件目录（房间↔会话映射、去重环、sync token、授权记录）。 */
   stateDir: string
+  /**
+   * 重试熔断阈值：同一房间 turn 内 LLM 受限自动重试达到该次数时，插件主动
+   * agent.cancel() 终止当前 turn 以止损（harness 的 always 模式无上限重试会持续烧 token）。
+   * 设为 0 或配合 retryCircuitBreakerEnabled=false 可关闭熔断。默认 5（给模型恢复机会）。
+   */
+  maxRetriesBeforeAbort: number
+  /** 是否启用重试熔断兜底（默认 true）。关闭后仅保留诊断日志，不做主动 cancel。 */
+  retryCircuitBreakerEnabled: boolean
 
   // ========== 数字分身支持 ==========
   /** 启用数字分身模式：@提及路由、Owner 授权记忆、红线强制确认。 */
@@ -82,6 +90,8 @@ export const Config: Schema<Config> = Schema.object({
   mergeTimeoutSecs: Schema.number().default(5),
   approvalTimeoutSecs: Schema.number().default(300),
   stateDir: Schema.string().default('.dsh-matrix'),
+  maxRetriesBeforeAbort: Schema.number().default(5),
+  retryCircuitBreakerEnabled: Schema.boolean().default(true),
 
   digitalTwinMode: Schema.boolean().default(false),
   digitalTwins: Schema.array(Schema.object({

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { formatToolCall, describeMedia, formatToolResult, formatTurnEnd, formatRetry, wantsProcess } from '../lib/format.js'
+import { formatToolCall, describeMedia, formatToolResult, formatTurnEnd, formatRetry, formatRetryCircuitTripped, wantsProcess } from '../lib/format.js'
 
 test('formatToolCall projects name with no args', () => {
   assert.equal(formatToolCall({ name: 'bash', arguments: '{}' }), '🔧 调用工具 `bash`')
@@ -96,9 +96,17 @@ test('formatRetry renders normal mode with cap', () => {
   assert.match(out, /rate limited/)
 })
 
-test('formatRetry renders always mode (no maxRetries)', () => {
+test('formatRetry renders always mode (no maxRetries) with warning', () => {
   const out = formatRetry({ retry: 3, delayMs: 0 })
   assert.match(out, /无上限退避/)
+  assert.match(out, /⚠️/)
+})
+
+test('formatRetryCircuitTripped mentions retry count and threshold', () => {
+  const out = formatRetryCircuitTripped(7, 5)
+  assert.match(out, /7 次重试/)
+  assert.match(out, /阈值 5/)
+  assert.match(out, /已终止本次会话以止损/)
 })
 
 // ---------- wantsProcess (verbosity trigger) ----------

@@ -222,9 +222,22 @@ export interface RetryLike {
 
 export function formatRetry(event: RetryLike): string {
   const delay = (event.delayMs / 1000).toFixed(1)
-  const cap = event.maxRetries !== undefined ? `（最多 ${event.maxRetries} 次）` : '（无上限退避）'
+  // always 模式（无 maxRetries）为无上限退避——这是 token 黑洞的来源，加 ⚠️ 警示。
+  const isUnbounded = event.maxRetries === undefined
+  const cap = isUnbounded ? '（⚠️ 无上限退避，将持续消耗 token）' : `（最多 ${event.maxRetries} 次）`
   const reason = event.failure?.message
   return `🔄 模型受限，正在第 ${event.retry} 次自动重试${cap}，延迟 ${delay}s${reason ? `：${reason}` : ''}`
+}
+
+/**
+ * 重试熔断落幕提示：插件在房间重试累计达阈值时主动 agent.cancel() 终止 turn，
+ * 以事件驱动方式停止 harness 的无限重试，避免 token 持续浪费。
+ */
+export function formatRetryCircuitTripped(retry: number, threshold: number): string {
+  return (
+    `🛑 已达 ${retry} 次重试（阈值 ${threshold}），已终止本次会话以止损。` +
+    `如需继续，请调整后重新发起。`
+  )
 }
 
 /**

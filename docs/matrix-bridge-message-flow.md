@@ -159,7 +159,7 @@ interface MediaBlock {
 | `tool/call` | 配对记录 callId↔name，不投文本 | 同上 | 仅供 `tool/result` 投影显示工具名 |
 | `tool/result` (失败) | 投失败提示 | 投失败提示 | 错误必见 |
 | `tool/result` (成功) | 折叠（不投） | 投成功摘要 | 结果党折叠中间结果 |
-| `llm/retry` | 折叠 | 投重试提示 | 过程党可见模型受限重试，避免误以为卡死 |
+| `llm/retry` | 始终日志诊断；达阈值熔断（结果党不展示提示，但记录到日志） | 投重试提示 + always 警示 | 过程党可见模型受限重试；两种模式都计数熔断止损 |
 | `step/start`/`step/end` | 忽略 | 忽略 | 编排内部步骤，已被 `assistant/message` 吸收 |
 | `assistant/chunk` | 忽略 | 忽略 | 流式增量，由 `assistant/message` 聚合 |
 | `user/message` | 忽略 | 忽略 | 入站事件，由 `handleMessage` 处理 |
@@ -178,7 +178,8 @@ harness 的 `tool/result` 事件**仅含 `callId` 不含工具名**。实现维�
 
 - `formatToolResult(event, toolName)` → 成功/失败可读文本，内容截断 800 字（与 `formatToolCall` 一致）。
 - `formatTurnEnd(reason)` → 非 `completed` 返回落幕提示；`completed` 返回 `undefined`。
-- `formatRetry(event)` → 重试轻提示（含次数/上限/延迟/原因）。
+- `formatRetry(event)` → 重试轻提示（含次数/上限/延迟/原因；`always` 无上限模式额外加 ⚠️ 警示）。
+- `formatRetryCircuitTripped(retry, threshold)` → 熔断落幕提示（已达 N 次/阈值 M，已终止止损）。
 
 ---
 
@@ -210,4 +211,58 @@ harness 的 `tool/result` 事件**仅含 `callId` 不含工具名**。实现维�
 - 增加「切回结果模式」触发词（如 `只看结果`）。
 - 把偏好持久化到 `AuthStore`/配置，跨会话保留。
 - 支持账号级默认（config `defaultVerbosity`），房间级覆盖。
+
+---
+
+## 9. retry 诊断与熔断（token 止损）
+
+> 背景：用户反馈「轮询太耗钱」。调研确认 dsh-matrix 出站本就事件驱动（Matrix `/sync`
+> 为服务端挂起长轮询，不耗 token），**真正烧 token 的是 harness 内核 `llm-retry` 的
+> `always` 无上限重试**——每次重试把整段上下文重发给 LLM。retry 策略属于 provider 配置，
+> 插件无法直接覆盖，但可观察 `llm/retry` 事件并在超限时主动 `agent.cancel()` 终止 turn。
+
+### 9.1 根因与边界
+
+- `retryPolicy` 在 harness `packages/llm/llm-retry` 中属于 **provider 配置**，dsh-matrix
+  只传 `provider`/`model` 路由名，不能直接改。本次**只在插件层做观察 + 熔断兜底**，不碰 harness。
+- `llm/retry` 事件含 `retry`（同 `(turn,step,provider,policyKey)` 链内严格单调递增，由框架
+  不变量保证）、`maxRetries?`（`undefined`=always 无上限）、`delayMs`、`failure?`。
+- `Agent.cancel({ kind: 'hook', reason })` 会中止活跃 turn，触发 `turn/end`（reason.kind=`aborted`），
+  复用既有落幕链路。
+
+### 9.2 诊断增强
+
+- **始终日志诊断**：`llm/retry` 到达时写 `logger.info`，含 roomId、retry 序号、mode
+  （`always(无上限)` / `normal(上限N)`）、失败原因。结果党即便不在聊天展示，也能事后复盘 token 消耗。
+- **过程模式展示**：`verbosity==='process'` 时 `safeSend` 完整重试提示；`always` 模式额外
+  标注 ⚠️「无上限退避，将持续消耗 token」，直接暴露 token 黑洞。
+
+### 9.3 熔断兜底
+
+- 按房间累计 `retryCounts: Map<roomId, number>`，每次取 `data.retry` 序号。
+- 当 `retry >= config.maxRetriesBeforeAbort`（**默认 5**）且 `retryCircuitBreakerEnabled`（默认 true）时：
+  - 校验 `handle.agent.status === 'running'`（避免对已完成 turn 无效 cancel）；
+  - 调 `handle.agent.cancel({ kind: 'hook', reason: 'dsh-matrix: retry circuit breaker at N/M' })`；
+  - `safeSend` 落幕提示 `formatRetryCircuitTripped(retry, threshold)`：「🛑 已达 N 次重试（阈值 M），已终止本次会话以止损」；
+  - 不再累加计数，避免 cancel 后重复触发。
+- `turn/end` 时清理 `retryCounts`（与 `toolNames` 并列）；`releaseRoom` 同样清理。无内存增长。
+
+### 9.4 配置项（src/config.ts）
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `maxRetriesBeforeAbort` | `5` | 同房间 turn 内重试达此次数即熔断；设为 `0` 配合开关可关闭 |
+| `retryCircuitBreakerEnabled` | `true` | 熔断总开关；关闭后仅保留诊断日志，不做主动 cancel |
+
+> 阈值取 5 是给用户指定值（给模型更多恢复机会），同时避免偶发限流被误杀。可在
+> `cordis.patch.yml` 的 `config` 中覆盖。
+
+### 9.5 数据流
+
+```
+llm/retry ──▶ 计数(按 roomId) + 始终日志诊断
+                ├─ verbosity=process ─▶ 展示 formatRetry（always 加 ⚠️）
+                └─ retry >= 阈值 ─▶ agent.cancel({kind:'hook'}) ─▶ turn/end(aborted) ─▶ 清理计数 + 落幕提示
+```
+
 
