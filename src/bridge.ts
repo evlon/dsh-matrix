@@ -17,7 +17,8 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import type { Config, DigitalTwinAccount } from './config.js'
-import { chunkText, markdownToHtml } from './format.js'
+import { chunkText, markdownToHtml, formatToolCall, describeMedia, wantsProcess, formatToolResult, formatTurnEnd, formatRetry } from './format.js'
+import type { Verbosity } from './format.js'
 import { MatrixChannel } from './matrix.js'
 import type { Channel, InboundMessage } from './matrix.js'
 import { BridgeState } from './store.js'
@@ -52,10 +53,114 @@ interface PendingApproval {
   readonly settle: (outcome: ApprovalOutcome) => void
 }
 
-/** 从 assistant 消息中提取可见文本块（跳过 reasoning）。 */
-function assistantText(event: Extract<SessionEvent, { type: 'assistant/message' }>): string | undefined {
-  const blocks = event.data.message.content.filter((block): block is TextBlock => block.type === 'text')
-  return blocks.length === 0 ? undefined : blocks.map((block) => block.text).join('')
+/**
+ * 出站主力投影：把 harness 结构化 `assistant/message` 渲染成 Matrix 可见文本。
+ *
+ * 之前只取 `text` 块，导致模型调用工具的 `tool-call` 块在 Matrix 端不可见，
+ * 模型被迫在 text 里裸写 `<invoke>` 协议而泄漏。这里按 content 顺序遍历：
+ *  - `text` 块：原样保留（与 GUI `toAssistantBlocks` 的 text 块一致）。
+ *  - `tool-call` 块：主动投影为可读的"调用工具 name + 参数摘要"。这样模型
+ *    无需在文本中裸写工具协议，从根上消除 `<invoke>` 泄漏，并保证 Matrix
+ *    与 GUI 的工具调用历史一致。
+ *  - `reasoning`/`tool-result`/`image` 等：按契约不在用户可见文本中展开
+ *    （reasoning 默认不可见，tool-result/image 由 GUI 折叠呈现，保持现状）。
+ */
+/** 类型谓词：把 harness 的 tool-call 块从 ContentBlock 联合中收窄出来。 */
+function isToolCallBlock(block: { type: string }): block is { type: 'tool-call'; name: string; arguments: string } {
+  return block.type === 'tool-call'
+}
+
+function assistantVisibleText(
+  event: Extract<SessionEvent, { type: 'assistant/message' }>,
+  verbosity: Verbosity,
+): string | undefined {
+  const showToolCalls = verbosity === 'process'
+  const parts: string[] = []
+  for (const block of event.data.message.content) {
+    if (block.type === 'text') {
+      parts.push((block as TextBlock).text)
+    } else if (isToolCallBlock(block) && showToolCalls) {
+      parts.push(formatToolCall(block))
+    }
+  }
+  const joined = parts.join('\n\n').trim()
+  return joined.length === 0 ? undefined : joined
+}
+
+/**
+ * 出站兜底防线（非主力）：仅当模型仍偶发把工具协议以 XML 文本写进 text 块时
+ * （典型 `<invoke name="bash">...</invoke>`），把泄漏文本折叠成一行提示，
+ * 避免污染 Matrix 房间/截图。主力是上面的 `tool-call` 主动投影，本函数仅作
+ * 最后防线，正常情况下不会命中。
+ *
+ * 保留：```围栏代码块```、行内 `code`、转义形式 `&lt;invoke ...&gt;` 原文不动。
+ */
+function sanitizeAssistantText(text: string): string {
+  if (!text.includes('<invoke')) return text
+  const lines = text.split('\n')
+  const out: string[] = []
+  let fence: string | null = null
+  const replaced: string[] = []
+  for (const line of lines) {
+    const trimmed = line.trimStart()
+    if (fence !== null) {
+      out.push(line)
+      if (trimmed.startsWith('```')) fence = null
+      continue
+    }
+    if (trimmed.startsWith('```')) {
+      fence = '```'
+      out.push(line)
+      continue
+    }
+    out.push(replaceInvokeOutsideInlineCode(line, replaced))
+  }
+  if (replaced.length > 0) {
+    out.push(`（已折叠 ${replaced.length} 处偶发裸写的工具协议，避免污染输出）`)
+  }
+  return out.join('\n')
+}
+
+function replaceInvokeOutsideInlineCode(line: string, replaced: string[]): string {
+  // 简易状态机：行内 `` 配对区间内保留原文；区间外执行剥除。
+  let result = ''
+  let i = 0
+  let buffer = ''
+  while (i < line.length) {
+    if (line[i] === '`') {
+      const close = line.indexOf('`', i + 1)
+      if (close === -1) {
+        buffer += line.slice(i)
+        break
+      }
+      // 把刚刚累积的 buffer 提交/剥除，再原样吐出行内代码段。
+      result += stripInvokeTags(buffer, replaced)
+      buffer = ''
+      result += line.slice(i, close + 1)
+      i = close + 1
+      continue
+    }
+    buffer += line[i]
+    i += 1
+  }
+  result += stripInvokeTags(buffer, replaced)
+  return result
+}
+
+function stripInvokeTags(segment: string, replaced: string[]): string {
+  if (!segment.includes('<invoke')) return segment
+  // 把模型裸回显的工具协议 XML 转成可读的"调用工具"提示，保留工具名与参数，
+  // 而不是直接删除导致信息丢失，也避免裸 <invoke> 文本污染 Matrix 房间/截图。
+  return segment.replace(/<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/g, (_whole, attrs: string, body: string) => {
+    const nameMatch = attrs.match(/\bname\s*=\s*"([^"]*)"/)
+    const name = nameMatch?.[1] ?? 'unknown'
+    const params = [...body.matchAll(/<parameter\b[^>]*\bname\s*=\s*"([^"]*)"[^>]*>([\s\S]*?)<\/parameter>/g)]
+      .map((m) => `  - ${m[1] ?? ''}: ${(m[2] ?? '').trim()}`)
+      .join('\n')
+    replaced.push(_whole)
+    const header = `🔧 调用工具 \`${name}\``
+    return params.length > 0 ? `${header}\n${params}` : header
+  })
 }
 
 function messageOf(error: unknown): string {
@@ -101,6 +206,16 @@ export class AccountBridge {
   private readonly roomAgentInflight = new Map<string, Promise<Agent>>()
   private readonly mergeBuffers = new Map<string, MergeBuffer>()
   private readonly pendingApprovals = new Map<string, PendingApproval[]>()
+  /**
+   * 工具名配对缓存：tool/result 事件只带 callId 不带 name，需经 tool/call 的
+   * callId↔name 配对。turn 结束时随房间清理，避免内存增长。
+   */
+  private readonly toolNames = new Map<string, string>()
+  /**
+   * 房间级 verbosity 偏好：默认 'result'（结果党）；用户说"给我过程信息"等触发词
+   * 时切到 'process'（过程党）。per-room 独立，不在房间间共享。
+   */
+  private readonly roomVerbosity = new Map<string, Verbosity>()
 
   constructor(
     ctx: Context,
@@ -309,17 +424,33 @@ export class AccountBridge {
       if (buffer.timer !== undefined) clearTimeout(buffer.timer)
       this.mergeBuffers.delete(roomId)
     }
+    this.toolNames.delete(roomId)
+    this.roomVerbosity.delete(roomId)
   }
 
   /** ---------- 入站消息 ---------- */
 
   private async handleMessage(message: InboundMessage): Promise<void> {
     try {
-      const text = message.text.trim()
+      // 入站归一化：把文本与媒体占位合并成一条 message.text。
+      // 媒体本轮仅占位（如「[图片: xxx.png]」），内容解析为后续扩展点；
+      // 不静默丢弃，避免用户发图后 agent 无响应造成的困惑。
+      const text = (message.text + describeMedia(message.media)).trim()
       if (text === '') return
 
       // 剥离 @提及 前缀后再判定命令/审批词（如 '@ai-dev /auth list'）。
       const stripped = text.replace(/@[a-z0-9._-]+(?::[a-z0-9._-]+)?/gi, '').trim()
+
+      // 偏好切换：检测过程模式触发词（"给我过程信息/我需要看到详细过程"等）。
+      // 命中即把本房间切到 process；默认 result；命令不触发（命令以 '/' 开头）。
+      if (!stripped.startsWith('/') && wantsProcess(stripped)) {
+        const prev = this.roomVerbosity.get(message.roomId) ?? 'result'
+        if (prev !== 'process') {
+          this.roomVerbosity.set(message.roomId, 'process')
+          this.ctx.logger.info('[dsh-matrix] room %s verbosity → process', message.roomId)
+          void this.safeSend(message.roomId, '🔍 已切换到「过程模式」：后续将展示工具调用、工具结果与重试等中间细节。', undefined)
+        }
+      }
 
       // 审批应答最优先（不受 @提及/私聊 路由门控限制）：
       // 配置了 owner 时仅 Owner 可应答；未配置 owner 时任意白名单用户可应答（旧行为）。
@@ -509,27 +640,85 @@ export class AccountBridge {
   handleSessionEvent(session: Session, event: SessionEvent): void {
     const roomId = this.roomForSession(session.id)
     if (roomId === undefined) return
-    switch (event.type) {
+    const verbosity = this.roomVerbosity.get(roomId) ?? 'result'
+    const data = event.data as any
+    // 用 string 比较放宽收窄，兼容宿主未导出的 'llm/retry' 等事件类型。
+    switch (event.type as string) {
       case 'turn/start':
         void this.channel.sendTyping(roomId, true).catch((error: unknown) => {
           this.ctx.logger.warn('[dsh-matrix] typing failed: %s', messageOf(error))
         })
         break
-      case 'turn/end':
+      case 'turn/end': {
         void this.channel.sendTyping(roomId, false).catch(() => {})
+        const reason = data.reason ?? {}
+        const msg = formatTurnEnd(reason)
+        if (msg !== undefined) {
+          this.ctx.logger.warn('[dsh-matrix] turn/end not completed: %s', reason.kind)
+          void this.safeSend(roomId, msg, undefined)
+        }
+        for (const key of this.toolNames.keys()) {
+          if (key.startsWith(`${roomId}:`)) this.toolNames.delete(key)
+        }
         break
+      }
+      case 'tool/call': {
+        // 记录 callId↔name 配对，供 tool/result 投影时显示工具名。
+        const callId = (data.message?.source?.callId as string) ?? ''
+        const name = (data.message?.content?.find?.((b: any) => b.type === 'tool-call')?.name as string) ?? ''
+        if (callId !== '') this.toolNames.set(`${roomId}:${callId}`, name)
+        break
+      }
+      case 'tool/result': {
+        if (verbosity !== 'process') {
+          // 结果党：仅错误时可见（否则折叠，避免噪声）。
+          const isError = data.message?.content?.[0]?.isError === true
+          if (!isError) break
+        }
+        const callId = (data.message?.source?.callId as string) ?? ''
+        const name = callId !== '' ? (this.toolNames.get(`${roomId}:${callId}`) ?? '') : ''
+        const result = formatToolResult(
+          {
+            callId,
+            isError: data.message?.content?.[0]?.isError === true,
+            content: data.message?.content?.[0]?.content ?? [],
+          },
+          name,
+        )
+        void this.safeSend(roomId, result, undefined)
+        break
+      }
+      case 'llm/retry': {
+        if (verbosity !== 'process') break
+        const retry = formatRetry({
+          retry: data.retry ?? 1,
+          maxRetries: data.maxRetries,
+          delayMs: data.delayMs ?? 0,
+          failure: data.failure,
+        })
+        void this.safeSend(roomId, retry, undefined)
+        break
+      }
       case 'assistant/message': {
-        const text = assistantText(event)
+        const text = assistantVisibleText(event as Extract<SessionEvent, { type: 'assistant/message' }>, verbosity)
         if (text !== undefined) void this.deliverText(roomId, text)
         break
       }
       default:
+        // 按设计忽略（与 GUI 可视化语义对齐，不 1:1 复刻 token 级细节）：
+        // - step/start / step/end：编排内部步骤标记，已由 assistant/message 吸收
+        // - assistant/chunk：流式增量，由 assistant/message 聚合后统一投
+        // - user/message：入站事件，由 handleMessage 处理，不在出站重投
+        // - tool/call：配对记录已在上方处理，无需单独投文本
+        // - request/header / compaction/* / attachment/* / run/* / agent/*：
+        //   内部/低层协议事件，对终端用户无独立意义
         break
     }
   }
 
   private async deliverText(roomId: string, text: string): Promise<void> {
-    for (const chunk of chunkText(text, this.config.chunkMaxChars)) {
+    const cleaned = sanitizeAssistantText(text)
+    for (const chunk of chunkText(cleaned, this.config.chunkMaxChars)) {
       await this.safeSend(roomId, chunk.plain, chunk.html)
     }
   }

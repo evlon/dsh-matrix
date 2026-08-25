@@ -14,10 +14,28 @@
 import { randomUUID } from 'node:crypto'
 import type { BridgeState } from './store.js'
 
+/**
+ * Matrix 媒体附件的归一化结构（入站扩展点）。
+ * 当前本轮只识别并保留结构 + 生成占位文本，不做 OCR/多模态解析；
+ * 后续图片处理应在此结构之上扩展（见 docs/matrix-bridge-message-flow.md）。
+ */
+export interface MediaBlock {
+  readonly msgtype: string
+  readonly mimetype?: string
+  readonly url?: string
+  readonly mxc?: string
+  readonly filename?: string
+  readonly size?: number
+  readonly body: string
+}
+
 export interface InboundMessage {
   readonly roomId: string
   readonly sender: string
+  /** 文本正文（m.text / m.notice 等）；纯媒体消息时为空串。 */
   readonly text: string
+  /** 非文字附件（图片/文件/音视频/位置）；本轮仅占位，不解析内容。 */
+  readonly media: MediaBlock[]
   readonly eventId: string
 }
 
@@ -63,7 +81,16 @@ interface MatrixEventJson {
   type?: string
   sender?: string
   event_id?: string
-  content?: { msgtype?: string; body?: string }
+  content?: {
+    msgtype?: string
+    body?: string
+    url?: string
+    mimetype?: string
+    /** m.image/m.file/m.audio/m.video 等携带的元信息。 */
+    info?: { mimetype?: string; size?: number }
+    /** m.location 的地理坐标。 */
+    geo_uri?: string
+  }
 }
 
 const SYNC_TIMEOUT_MS = 30_000
@@ -173,13 +200,36 @@ export class MatrixChannel implements Channel {
     const sender = event.sender
     if (sender === undefined || sender === this.options.userId) return
     const content = event.content
-    if (content === undefined || content.msgtype !== 'm.text' || typeof content.body !== 'string') return
+    if (content === undefined || typeof content.body !== 'string') return
+    const msgtype = content.msgtype ?? 'm.text'
     const eventId = event.event_id
     if (eventId === undefined || this.options.state.hasSeen(eventId)) return
     // 去重先于分发：无论是否授权都记录已处理，避免每次 sync 重放。
     this.options.state.markSeen(eventId)
     if (!(this.options.isAllowed?.(sender) ?? true)) return
-    this.options.onMessage?.({ roomId, sender, text: content.body, eventId })
+
+    // 非文字消息（图片/文件/音视频/位置）：归一成 media，text 留空。
+    // 本轮只识别结构、生成占位文本；内容解析（OCR/多模态）为后续扩展点。
+    const MEDIA_MSGTYPES = new Set(['m.image', 'm.file', 'm.audio', 'm.video', 'm.location'])
+    let text = content.body
+    let media: MediaBlock[] = []
+    if (MEDIA_MSGTYPES.has(msgtype)) {
+      media = [{
+        msgtype,
+        body: content.body,
+        mimetype: content.mimetype ?? content.info?.mimetype,
+        url: content.url,
+        size: content.info?.size,
+        ...(msgtype === 'm.location' ? { mxc: undefined } : {}),
+      }]
+      // 文字型 msgtype（m.text/m.notice）仍作为 text 透传；媒体消息 text 置空。
+      if (msgtype === 'm.text' || msgtype === 'm.notice') {
+        // 保持 text
+      } else {
+        text = ''
+      }
+    }
+    this.options.onMessage?.({ roomId, sender, text, media, eventId })
   }
 
   async sendText(roomId: string, plain: string, html?: string): Promise<void> {

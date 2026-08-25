@@ -93,3 +93,158 @@ function splitContent(text: string, capacity: number): string[] {
   parts.push(rest)
   return parts
 }
+
+/** harness tool-call 块的最小形状（与 @deepseek-ai/dsh-llm 的 ToolCallBlock 对齐）。 */
+export interface ToolCallLike {
+  name: string
+  arguments: string
+}
+
+/** harness MediaBlock 的最小形状（与 src/matrix.ts 的 MediaBlock 对齐）。 */
+export interface MediaLike {
+  msgtype: string
+  body: string
+  mimetype?: string
+  filename?: string
+}
+
+/**
+ * 把结构化 tool-call 块投影为 Matrix 可读文本（与 GUI tool-call 折叠块语义对应）。
+ * arguments 为 JSON 字符串，解析失败时回退原始字符串，避免坏参数导致整条消息失败。
+ */
+export function formatToolCall(block: ToolCallLike): string {
+  let args: unknown
+  try {
+    args = JSON.parse(block.arguments)
+  } catch {
+    args = block.arguments
+  }
+  const header = `🔧 调用工具 \`${block.name}\``
+  if (typeof args !== 'object' || args === null) {
+    return args === '' || args === undefined ? header : `${header}\n${String(args)}`
+  }
+  const lines = Object.entries(args as Record<string, unknown>).map(([key, value]) => {
+    const pretty = typeof value === 'string' ? value : JSON.stringify(value)
+    const clipped = pretty.length > 800 ? `${pretty.slice(0, 800)}…(已截断)` : pretty
+    return `  - ${key}: ${clipped}`
+  })
+  return lines.length === 0 ? header : `${header}\n${lines.join('\n')}`
+}
+
+/**
+ * 出站 verbosity 模式：决定把哪些 harness 事件投影给用户。
+ * - `result`：结果党，只关心最终答案；工具调用/中间结果默认折叠。
+ * - `process`：过程党，想要看到工具调用、工具结果、重试等中间细节。
+ * 默认 `result`（用户在入站消息里说"给我过程信息/我需要看到详细过程"时切到 process）。
+ */
+export type Verbosity = 'result' | 'process'
+
+/** 用户切换偏好的触发词（大小写不敏感、子串匹配）。命中即切到 process。 */
+export const PROCESS_TRIGGERS = [
+  '给我过程信息',
+  '我需要看到详细过程',
+  '显示过程',
+  '看过程',
+  '详细过程',
+  'show process',
+  'verbose',
+]
+
+/** 判定一条入站文本是否要求切换到过程模式。 */
+export function wantsProcess(text: string): boolean {
+  const lower = text.toLowerCase()
+  return PROCESS_TRIGGERS.some((trigger) => lower.includes(trigger.toLowerCase()))
+}
+
+/**
+ * 把 harness `tool/result` 事件投影为 Matrix 可读文本。
+ * `event` 仅含 callId，工具名经 `toolName` 外部配对传入；查不到时回退「工具（callId）」。
+ * - 失败（isError）：用 ⚠️ 标注，便于过程模式下用户看见工具为何失败；
+ * - 成功：默认折叠（结果党），仅过程模式下展开摘要。
+ * 内容摘要截断策略与 formatToolCall 一致（800 字）。
+ */
+export interface ToolResultLike {
+  callId: string
+  isError?: boolean
+  content: { type: string; text?: string }[]
+}
+
+export function formatToolResult(event: ToolResultLike, toolName: string): string {
+  const label = toolName !== '' ? toolName : `工具（${event.callId}）`
+  const summary = event.content
+    .filter((block) => block.type === 'text' && block.text !== undefined)
+    .map((block) => block.text as string)
+    .join('\n')
+    .trim()
+  const clipped = summary.length > 800 ? `${summary.slice(0, 800)}…(已截断)` : summary
+  const header = event.isError === true ? `⚠️ 工具 \`${label}\` 执行失败` : `✅ 工具 \`${label}\` 执行成功`
+  return clipped.length === 0 ? header : `${header}\n${clipped}`
+}
+
+/**
+ * 把 harness `turn/end` 的结束原因投影为落幕提示文本。
+ * 仅当 reason.kind 非 `completed` 时由调用方投递；`completed` 返回 undefined（无需提示）。
+ * - error：展示结构化 LlmFailure.message（及 code）；
+ * - aborted/blocked/max-tokens/interrupted：展示 kind 中文说明。
+ */
+export function formatTurnEnd(reason: { kind: string; error?: { message: string; code: string } }): string | undefined {
+  switch (reason.kind) {
+    case 'completed':
+      return undefined
+    case 'error': {
+      const msg = reason.error?.message ?? '未知错误'
+      const code = reason.error?.code
+      return `⚠️ 本次会话因错误结束：${msg}${code !== undefined ? `（${code}）` : ''}`
+    }
+    case 'aborted':
+      return '⚠️ 本次会话被中断（aborted）。'
+    case 'blocked':
+      return '⚠️ 本次会话被阻塞（blocked），可能需要额外授权或输入。'
+    case 'max-tokens':
+      return '⚠️ 本次会话因达到 token 上限而结束（max-tokens）。'
+    case 'interrupted':
+      return '⚠️ 本次会话被外部打断（interrupted）。'
+    default:
+      return `⚠️ 本次会话异常结束（${reason.kind}）。`
+  }
+}
+
+/**
+ * 把 harness `llm/retry` 事件投影为轻提示。供过程模式提示用户模型受限自动重试，
+ * 避免误以为卡死。normal 模式含 maxRetries，always 模式无上限。
+ */
+export interface RetryLike {
+  retry: number
+  maxRetries?: number
+  delayMs: number
+  failure?: { message: string }
+}
+
+export function formatRetry(event: RetryLike): string {
+  const delay = (event.delayMs / 1000).toFixed(1)
+  const cap = event.maxRetries !== undefined ? `（最多 ${event.maxRetries} 次）` : '（无上限退避）'
+  const reason = event.failure?.message
+  return `🔄 模型受限，正在第 ${event.retry} 次自动重试${cap}，延迟 ${delay}s${reason ? `：${reason}` : ''}`
+}
+
+/**
+ * 入站媒体占位：把非文字附件描述成可读文本，并入 message.text。
+ * 本轮不解析媒体内容（OCR/多模态），仅保留结构 + 占位，作为后续扩展点。
+ * 返回的占位文本保证非空，使纯媒体消息也能进入处理流程而不被静默丢弃。
+ */
+export function describeMedia(media: readonly MediaLike[]): string {
+  if (media.length === 0) return ''
+  const LABELS: Record<string, string> = {
+    'm.image': '图片',
+    'm.file': '文件',
+    'm.audio': '音频',
+    'm.video': '视频',
+    'm.location': '位置',
+  }
+  const parts = media.map((m) => {
+    const label = LABELS[m.msgtype] ?? '附件'
+    const name = m.filename ?? m.body ?? label
+    return `[${label}: ${name}${m.mimetype !== undefined ? ` (${m.mimetype})` : ''}]`
+  })
+  return '\n' + parts.join(' ')
+}
