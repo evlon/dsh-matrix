@@ -8,7 +8,6 @@
  * @module dsh-matrix/bridge
  */
 
-import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
@@ -66,6 +65,16 @@ function messageOf(error: unknown): string {
 function localpartOf(mxid: string): string {
   const at = mxid.indexOf(':')
   return at > 0 ? mxid.slice(1, at) : mxid.slice(1)
+}
+
+/** 稳定短哈希（FNV-1a 32bit → 8 位 hex），用于确定性会话 id。 */
+function stableHash(input: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(16).padStart(8, '0')
 }
 
 /**
@@ -210,6 +219,7 @@ export class AccountBridge {
     const existing = this.roomAgents.get(roomId)
     if (existing !== undefined) return existing.agent
 
+    // 优先 resume 历史绑定（旧随机 id 会话的迁移路径）。
     const binding = this.state.roomSession(roomId)
     if (binding !== undefined) {
       try {
@@ -220,13 +230,14 @@ export class AccountBridge {
         this.roomAgents.set(roomId, handle)
         return handle.agent
       } catch (error) {
-        this.ctx.logger.warn('[dsh-matrix] resume %s failed (%s); starting fresh', binding, messageOf(error))
+        this.ctx.logger.warn('[dsh-matrix] resume %s failed (%s); falling back to deterministic id', binding, messageOf(error))
       }
     }
 
-    // 创建时必须指定 agentPreset：缺省会导致 agent 落在空全局层，没有任何工具
-    //（模型只能把工具调用写成文本，无法真正执行——即本次线上 bug 的根因）。
-    const sessionId = SessionId(`matrix-${localpartOf(this.userId)}-${randomUUID()}`)
+    // 确定性会话 id：同一房间永远同一 id。agents.create 语义为——
+    // 首次创建；重挂载且持久化已存在时自动恢复历史（见 dsh-agent-loop README）。
+    // 这样重启后同一房间回到同一会话，GUI 不再堆积多个"会话"。
+    const sessionId = SessionId(`matrix-${localpartOf(this.userId)}-${stableHash(roomId)}`)
     const handle = await this.ctx.agents.create({
       sessionId,
       meta: { cwd: process.cwd(), agentPreset: this.config.agentPreset ?? 'standard' },
