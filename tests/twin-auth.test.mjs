@@ -59,6 +59,7 @@ function fakeHomeserver() {
       }
       if (path.includes('/typing/')) return { ok: true, status: 200, async json() { return {} } }
       if (path.endsWith('/join')) return { ok: true, status: 200, async json() { return { room_id: ROOM_ID } } }
+      if (path.includes('/state/m.room.name')) return { ok: true, status: 200, async json() { return { name: '数智化部全员群' } } }
       return { ok: true, status: 200, async json() { return {} } }
     },
     deliver(events) {
@@ -77,7 +78,7 @@ function textEvent(eventId, body, sender = SENDER) {
 }
 
 function makeCtx() {
-  const captured = { messages: [], sessionHandler: undefined, approvalHandler: undefined, agents: [] }
+  const captured = { messages: [], sessionHandler: undefined, approvalHandler: undefined, agents: [], titles: [] }
   return {
     captured,
     ctx: {
@@ -85,6 +86,14 @@ function makeCtx() {
       on(event, handler) {
         if (event === 'session/event') captured.sessionHandler = handler
         return () => {}
+      },
+      get(service) {
+        if (service === 'sessionTitle') {
+          return {
+            rename(session, title) { captured.titles.push({ id: session.id, title }) },
+          }
+        }
+        return undefined
       },
       inject(_deps, cb) {
         cb({
@@ -163,6 +172,11 @@ test('multi-account + owner auth: twin approval, auth commands, routing', async 
     await waitFor(() => captured.messages.length === 1, 'main responds')
     assert.equal(captured.messages[0].content[0].text, '你好')
     captured.messages.length = 0
+
+    // 1.5) 会话标题 = Matrix 房间名（rename 被调用且标题正确）
+    await waitFor(() => captured.titles.length >= 1, 'session titled from room name')
+    const titled = captured.titles.find((t) => t.title === '数智化部全员群')
+    assert.ok(titled, 'title should equal matrix room name')
 
     // 2) 分身收到 @提及 → 响应（主账号应让位，只有 twin 注入）
     hs.deliver([textEvent('$t1', `@bot-twin:hs.example 你好!!`)])

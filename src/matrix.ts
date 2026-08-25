@@ -45,6 +45,8 @@ export interface Channel {
   sendTyping(roomId: string, active: boolean): Promise<void>
   /** 判断是否为私聊房间（2 人房间）。 */
   isDirectRoom?(roomId: string): Promise<boolean>
+  /** 读取房间名（m.room.name state）。 */
+  getRoomName?(roomId: string): Promise<string | undefined>
 }
 
 /** /sync 响应中我们关心的最小结构。 */
@@ -68,6 +70,7 @@ const SYNC_TIMEOUT_MS = 30_000
 const SYNC_FILTER = JSON.stringify({ room: { timeline: { limit: 10 } } })
 const BASE_BACKOFF_MS = 1000
 const DM_CACHE_TTL_MS = 60_000
+const NAME_CACHE_TTL_MS = 5 * 60_000
 
 export class MatrixChannel implements Channel {
   private readonly baseUrl: string
@@ -75,6 +78,7 @@ export class MatrixChannel implements Channel {
   private readonly sleepFn: (ms: number) => Promise<void>
   private readonly warnedEncrypted = new Set<string>()
   private readonly dmCache = new Map<string, { isDm: boolean; at: number }>()
+  private readonly nameCache = new Map<string, { name?: string; at: number }>()
   private stopped = false
   private loop: Promise<void> | undefined
   private lifecycleAbort: AbortController | undefined
@@ -219,6 +223,25 @@ export class MatrixChannel implements Channel {
       return isDm
     } catch {
       return false
+    }
+  }
+
+  /** 读取房间名（m.room.name state）。带 TTL 缓存；无名字或失败返回 undefined。 */
+  async getRoomName(roomId: string): Promise<string | undefined> {
+    const cached = this.nameCache.get(roomId)
+    if (cached !== undefined && Date.now() - cached.at < NAME_CACHE_TTL_MS) return cached.name
+    try {
+      const url = `${this.baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.name`
+      const response = await this.fetchFn(url, {
+        headers: { Authorization: `Bearer ${this.options.accessToken}` },
+      })
+      if (!response.ok) return undefined
+      const data = (await response.json()) as { name?: string }
+      const name = typeof data.name === 'string' && data.name.trim() !== '' ? data.name.trim() : undefined
+      this.nameCache.set(roomId, { name, at: Date.now() })
+      return name
+    } catch {
+      return undefined
     }
   }
 

@@ -245,7 +245,23 @@ export class AccountBridge {
     })
     this.roomAgents.set(roomId, handle)
     this.state.setRoomSession(roomId, handle.agent.id)
+    // 会话标题 = Matrix 房间名（pin 住，自动标题不再覆盖）。
+    void this.nameSessionFromRoom(roomId, handle.agent)
     return handle.agent
+  }
+
+  /** 若 Matrix 房间有名字，把 agent 会话标题固定为房间名。 */
+  private async nameSessionFromRoom(roomId: string, agent: Agent): Promise<void> {
+    try {
+      const roomName = await this.channel.getRoomName?.(roomId)
+      if (roomName === undefined || roomName === '') return
+      const title = this.ctx.get('sessionTitle')
+      if (title === undefined) return
+      title.rename(agent.session, roomName)
+      this.ctx.logger.info('[dsh-matrix] session %s titled "%s"', agent.id, roomName)
+    } catch (error) {
+      this.ctx.logger.warn('[dsh-matrix] title rename failed: %s', messageOf(error))
+    }
   }
 
   private async releaseRoom(roomId: string): Promise<void> {
