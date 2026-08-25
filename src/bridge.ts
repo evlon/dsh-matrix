@@ -223,10 +223,12 @@ export class AccountBridge {
       }
     }
 
+    // 创建时必须指定 agentPreset：缺省会导致 agent 落在空全局层，没有任何工具
+    //（模型只能把工具调用写成文本，无法真正执行——即本次线上 bug 的根因）。
     const sessionId = SessionId(`matrix-${localpartOf(this.userId)}-${randomUUID()}`)
     const handle = await this.ctx.agents.create({
       sessionId,
-      meta: { cwd: process.cwd() },
+      meta: { cwd: process.cwd(), agentPreset: this.config.agentPreset ?? 'standard' },
       agentOptions: this.agentOptions,
     })
     this.roomAgents.set(roomId, handle)

@@ -24,6 +24,9 @@
         allowAllUsers: true
         provider: 'sharkai'
         model: 'deepseek-v4-flash'
+        # room agent 挂载的 agent preset：standard 提供完整工具（bash/pwsh/fs/…）。
+        # 缺失会导致 agent 无任何工具，模型只能把工具调用写成文本（无法真正执行）。
+        agentPreset: 'standard'
         chunkMaxChars: 4000
         mergeTimeoutSecs: 5
         approvalTimeoutSecs: 300

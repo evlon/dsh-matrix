@@ -42,6 +42,11 @@ export interface Config {
   provider: string
   /** 默认模型 id（分身未指定时使用）。 */
   model: string
+  /**
+   * room agent 挂载的 agent preset（决定其工具集与角色提示）。
+   * 缺省 standard 提供完整工具（bash/pwsh/fs/…）；留空则 agent 无任何工具。
+   */
+  agentPreset: string
   /** 出站单条消息的最大字符数（含分段前缀）。 */
   chunkMaxChars: number
   /** 裸文本消息的合并窗口（秒）；'..' 后缀继续、'!!' 后缀立即提交。 */
@@ -72,6 +77,7 @@ export const Config: Schema<Config> = Schema.object({
   respondToAll: Schema.boolean().default(true),
   provider: Schema.string().default('deepseek-official'),
   model: Schema.string().default('deepseek-v4-flash'),
+  agentPreset: Schema.string().default('standard'),
   chunkMaxChars: Schema.number().default(4000),
   mergeTimeoutSecs: Schema.number().default(5),
   approvalTimeoutSecs: Schema.number().default(300),
