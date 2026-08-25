@@ -65,6 +65,8 @@ export interface Channel {
   isDirectRoom?(roomId: string): Promise<boolean>
   /** 读取房间名（m.room.name state）。 */
   getRoomName?(roomId: string): Promise<string | undefined>
+  /** 房间当前成员数（joined_members）。仅用于群聊上下文标签，绝不全量注入消息。 */
+  getRoomMemberCount?(roomId: string): Promise<number | undefined>
 }
 
 /** /sync 响应中我们关心的最小结构。 */
@@ -98,6 +100,7 @@ const SYNC_FILTER = JSON.stringify({ room: { timeline: { limit: 10 } } })
 const BASE_BACKOFF_MS = 1000
 const DM_CACHE_TTL_MS = 60_000
 const NAME_CACHE_TTL_MS = 5 * 60_000
+const COUNT_CACHE_TTL_MS = 5 * 60_000
 
 export class MatrixChannel implements Channel {
   private readonly baseUrl: string
@@ -106,6 +109,7 @@ export class MatrixChannel implements Channel {
   private readonly warnedEncrypted = new Set<string>()
   private readonly dmCache = new Map<string, { isDm: boolean; at: number }>()
   private readonly nameCache = new Map<string, { name?: string; at: number }>()
+  private readonly countCache = new Map<string, { count: number | undefined; at: number }>()
   private stopped = false
   private loop: Promise<void> | undefined
   private lifecycleAbort: AbortController | undefined
@@ -290,6 +294,25 @@ export class MatrixChannel implements Channel {
       const name = typeof data.name === 'string' && data.name.trim() !== '' ? data.name.trim() : undefined
       this.nameCache.set(roomId, { name, at: Date.now() })
       return name
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 房间当前成员数（joined_members）。带 TTL 缓存；仅用于群聊上下文标签，失败返回 undefined。 */
+  async getRoomMemberCount(roomId: string): Promise<number | undefined> {
+    const cached = this.countCache.get(roomId)
+    if (cached !== undefined && Date.now() - cached.at < COUNT_CACHE_TTL_MS) return cached.count
+    try {
+      const url = `${this.baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/joined_members`
+      const response = await this.fetchFn(url, {
+        headers: { Authorization: `Bearer ${this.options.accessToken}` },
+      })
+      if (!response.ok) return undefined
+      const data = (await response.json()) as { joined?: Record<string, unknown> }
+      const count = data.joined === undefined ? undefined : Object.keys(data.joined).length
+      this.countCache.set(roomId, { count, at: Date.now() })
+      return count
     } catch {
       return undefined
     }

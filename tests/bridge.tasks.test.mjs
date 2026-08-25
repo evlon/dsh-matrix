@@ -175,7 +175,7 @@ test('matrix tasks: enqueue, cwd guide, approve, serial, reject, allow/deny', as
     hs.sends.length = 0
     hs.deliver([textEvent('$c3', OWNER, '1')])
     await waitFor(() => captured.messages.length === 1)
-    assert.equal(captured.messages[0].content[0].text, '帮我画一张图')
+    assert.match(captured.messages[0].content[0].text, /^\[群聊，你是@bot\]\n帮我画一张图$/)
     assert.equal(captured.messages[0].source.sender, SENDER)
     // 任务一执行完（模拟 turn/end）释放 runningTask
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
@@ -186,13 +186,13 @@ test('matrix tasks: enqueue, cwd guide, approve, serial, reject, allow/deny', as
     hs.sends.length = 0
     hs.deliver([textEvent('$c4', OWNER, '/approve 1')]) // 第1条待审=任务二
     await waitFor(() => captured.messages.length === 2)
-    assert.equal(captured.messages[1].content[0].text, '任务二')
+    assert.match(captured.messages[1].content[0].text, /^\[群聊，你是@bot\]\n任务二$/)
     // 任务二 turn 结束 -> 释放，任务三变为第1条待审
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
     hs.sends.length = 0
     hs.deliver([textEvent('$c5', OWNER, '/approve 1')]) // 现在第1条=任务三
     await waitFor(() => captured.messages.length === 3)
-    assert.equal(captured.messages[2].content[0].text, '任务三')
+    assert.match(captured.messages[2].content[0].text, /^\[群聊，你是@bot\]\n任务三$/)
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
 
     // 6) 串行约束：running 时 approve 的新任务应排队等待 turn/end
@@ -201,7 +201,7 @@ test('matrix tasks: enqueue, cwd guide, approve, serial, reject, allow/deny', as
     hs.sends.length = 0
     hs.deliver([textEvent('$c9', OWNER, '/approve 1')]) // 任务四立即执行（当前无 running）
     await waitFor(() => captured.messages.length === 4)
-    assert.equal(captured.messages[3].content[0].text, '任务四')
+    assert.match(captured.messages[3].content[0].text, /^\[群聊，你是@bot\]\n任务四$/)
     // 此时任务四 running，再入任务五并 approve，应排队（不立即执行）
     hs.deliver([textEvent('$m8', SENDER, '任务五')])
     await waitFor(() => hs.sends.some((s) => s.body.body.includes('📥 新任务已入队')))
@@ -211,7 +211,7 @@ test('matrix tasks: enqueue, cwd guide, approve, serial, reject, allow/deny', as
     assert.equal(captured.messages.length, 4, '任务五应在任务四 turn/end 后才执行（串行）')
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
     await waitFor(() => captured.messages.length === 5)
-    assert.equal(captured.messages[4].content[0].text, '任务五')
+    assert.match(captured.messages[4].content[0].text, /^\[群聊，你是@bot\]\n任务五$/)
     // 任务五自身 turn 结束 -> 释放 runningTask
     captured.sessionHandler({ id: captured.agents[0].agent.id }, { type: 'turn/end', data: { reason: { kind: 'done' } }, agent: captured.agents[0].agent })
 
@@ -229,7 +229,7 @@ test('matrix tasks: enqueue, cwd guide, approve, serial, reject, allow/deny', as
     await waitFor(() => hs.sends.some((s) => s.body.body.includes('已添加白')))
     hs.deliver([textEvent('$m5', SENDER, '日报：今日进展')])
     await waitFor(() => captured.messages.length === 6)
-    assert.equal(captured.messages[5].content[0].text, '日报：今日进展')
+    assert.match(captured.messages[5].content[0].text, /^\[群聊，你是@bot\]\n日报：今日进展$/)
 
     // 9) /reject 拒绝待审（新任务即第 1 条待审）
     hs.deliver([textEvent('$m6', SENDER, '另一个任务')])

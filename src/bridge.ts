@@ -340,8 +340,10 @@ export class AccountBridge {
 
   /**
    * 消息路由（多账号协作语义）：
-   * 1. 若消息 @提及 了任一已知账号（主账号或分身），则只有被 @提及 的账号响应；
-   * 2. 无任何 @提及 时：主账号响应全部（旧行为）；分身仅响应 respondToAll 或私聊（≤2 人房间）。
+   * 1. 若消息 @提及 了任一已知账号（主账号或分身），则只有被 @提及 的账号响应，
+   *    其余账号（含主账号）一律静默，避免抢答别人/别的数字人的对话；
+   * 2. 无任何 @提及 时：私聊（≤2 人房间）始终响应；群聊里仅主账号（个人助手模式）
+   *    兜底响应全部，分身必须被显式 @提及 才响应，绝不抢答未指名给自己的群消息。
    * 命令同样遵循该规则；审批应答不受此门控限制（在 handleMessage 中先行处理）。
    */
   private async shouldRespond(message: InboundMessage): Promise<boolean> {
@@ -349,11 +351,14 @@ export class AccountBridge {
     const mentioned = this.allAccountIds.filter((id) =>
       lower.includes(`@${localpartOf(id).toLowerCase()}`) || lower.includes(id.toLowerCase()),
     )
+    // 消息 @提及了某个已知账号：只有被 @的账号响应，其余全部静默（含主账号）。
     if (mentioned.length > 0) {
       return mentioned.includes(this.userId)
     }
-    if (this.respondToAll) return true
+    // 无人被 @提及：私聊始终响应。
     if (this.channel.isDirectRoom && await this.channel.isDirectRoom(message.roomId)) return true
+    // 群聊：仅主账号（个人助手模式）兜底响应全部；分身必须被 @提及 才响应。
+    if (this.isMain && this.respondToAll) return true
     return false
   }
 
@@ -699,10 +704,33 @@ export class AccountBridge {
    * Matrix 里看到的输入在 GUI 历史中不可见。'user' 让输入在两边一致可见。
    * sender 一并带上，多人群聊时 GUI 历史可区分说话人。
    */
+  /**
+   * 构造一条极小的房间上下文标签（约 1 行，token 与群人数无关）。
+   * 仅用于让 agent 知道自己身处的会话类型（群聊/私聊）与身份，消除"把群聊当 1v1"的误判。
+   * 绝不注入成员名单——大群也不会放大 token。群名/人数均走带缓存的接口。
+   */
+  private async roomContextLabel(roomId: string): Promise<string> {
+    const isDm = this.channel.isDirectRoom ? await this.channel.isDirectRoom(roomId) : false
+    const me = `@${localpartOf(this.userId)}`
+    if (isDm) {
+      const name = this.channel.getRoomName ? await this.channel.getRoomName(roomId) : undefined
+      const peer = name !== undefined ? `（${name}）` : ''
+      return `[私聊${peer}，你是${me}]`
+    }
+    const roomName = this.channel.getRoomName ? await this.channel.getRoomName(roomId) : undefined
+    const count = this.channel.getRoomMemberCount ? await this.channel.getRoomMemberCount(roomId) : undefined
+    const head = roomName !== undefined ? `群聊「${roomName}」` : '群聊'
+    const size = count !== undefined ? `，约${count}人` : ''
+    return `[${head}${size}，你是${me}]`
+  }
+
   private async deliver(roomId: string, text: string, sender?: string): Promise<void> {
     const agent = await this.getRoomAgent(roomId)
+    // 群聊上下文：群名+人数+身份一行前缀，避免 agent 误把群消息当私聊对话。
+    const label = await this.roomContextLabel(roomId)
+    const prefixed = `${label}\n${text}`
     agent.followup(createUserMessage({
-      content: [{ type: 'text', text }],
+      content: [{ type: 'text', text: prefixed }],
       source: {
         kind: 'user',
         ...(sender !== undefined ? { sender } : {}),

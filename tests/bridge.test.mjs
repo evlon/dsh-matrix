@@ -57,6 +57,13 @@ function fakeHomeserver() {
         sends.push({ kind: 'send', body: JSON.parse(init.body) })
         return { ok: true, status: 200, async json() { return { event_id: '$out' } } }
       }
+      if (path.includes('/joined_members')) {
+        // 3 人房间（>2 即群聊），用于验证上下文标签的人数渲染。
+        return { ok: true, status: 200, async json() { return { joined: { '@a:hs': {}, '@b:hs': {}, '@bot:hs': {} } } } }
+      }
+      if (path.includes('/state/m.room.name')) {
+        return { ok: true, status: 200, async json() { return { name: '测试群' } } }
+      }
       if (path.includes('/typing/')) return { ok: true, status: 200, async json() { return {} } }
       if (path.endsWith('/join')) return { ok: true, status: 200, async json() { return { room_id: ROOM_ID } } }
       return { ok: true, status: 200, async json() { return {} } }
@@ -151,7 +158,8 @@ test('bridge end-to-end: merge, assistant delivery, approval, commands, dedup, s
     hs.deliver([textEvent('$e1', '你好..'), textEvent('$e2', '世界!!')])
     await waitFor(() => captured.messages.length === 1)
     const merged = captured.messages[0]
-    assert.equal(merged.content[0].text, '你好\n世界')
+    // 群聊上下文标签注入：房间名+人数+身份一行前缀（token 与群人数无关，不注入名单）。
+    assert.match(merged.content[0].text, /^\[群聊「测试群」，约3人，你是@bot\]\n你好\n世界$/)
     assert.equal(merged.source.kind, 'user')
     assert.equal(merged.source.sender, SENDER)
     const agentId = captured.agents[0].agent.id
