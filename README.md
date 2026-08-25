@@ -13,6 +13,81 @@ src/
 └── format.ts     # 保守 markdown 子集 → Matrix HTML，收敛前缀长回复分段
 ```
 
+## 架构
+
+### 整体拓扑：每个分身一个 harness 进程
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        Matrix 房间（每个平台/模块一个房间）                        │
+│                                                                              │
+│   真人同事 @tianjintao   真人（Owner）@niukunliang     其他分身 @ai-liuliye      │
+│     （Matrix 客户端）      （Matrix 客户端，仅客户端登录）   （跑在自己的 harness）    │
+└──────────┬──────────────────────┬─────────────────────────┬──────────────────┘
+           │                      │                         │
+           │       房间内对话 / @提及 / 审批「批准/拒绝」        │
+           ▼                      ▼                         ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         Matrix Homeserver（im-ipm.ict.cmcc）                    │
+└──────┬───────────────────────┬──────────────────────────┬───────────────────┘
+       │                       │                          │
+       ▼                       ▼                          ▼
+┌──────────────┐      ┌──────────────┐           ┌──────────────┐
+│ Harness 进程 A │      │ Harness 进程 B │           │ Harness 进程 C │
+│              │      │              │           │              │
+│ userId:      │      │ userId:      │           │  （每个分身    │
+│ @ai-niukun-  │      │ @ai-niukun-  │           │   一个独立     │
+│ liang        │      │ liang-dev    │           │   进程）       │
+│ owner:       │      │ owner:       │           │              │
+│ @niukunliang │      │ @niukunliang │           │              │
+└──────┬───────┘      └──────┬───────┘           └──────────────┘
+       │                     │
+       ▼                     ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                          dsh-matrix 插件（每个进程各跑一份）                      │
+│                                                                              │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────────────────────┐  │
+│  │ 通道层 matrix.ts │  │ 桥接层 bridge.ts │  │ 授权库 auth-store.ts            │  │
+│  │ · /sync 长轮询   │  │ · 消息路由        │  │ · 记忆授权（L1 静默放行）         │  │
+│  │ · send/typing  │  │   @提及/私聊/兜底 │  │ · Owner 房间确认（L2）            │  │
+│  │ · 邀请自动加入    │  │ · 合并窗口 .. !!  │  │ · 红线强制确认（L3，每次）        │  │
+│  │                │  │ · per-room agent │  │ · auth-store.json 落盘          │  │
+│  └────────────────┘  └────────────────┘  └────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 身份模型
+
+| 角色 | Matrix 账号 | 登录位置 | 职责 |
+|---|---|---|---|
+| **真人（Owner）** | `@niukunliang:im-ipm.ict.cmcc` | **仅 Matrix 客户端** | 在房间与分身对话、应答「批准/拒绝」审批、吊销授权 |
+| **数字分身** | `@ai-niukunliang:im-ipm.ict.cmcc` | **自己的 harness 进程** | 与真人同事、其他分身协作，执行研发/测试等工作 |
+| **真人同事** | `@tianjintao:im-ipm.ict.cmcc` 等 | Matrix 客户端 | 在房间与分身协作（能否驱动分身由白名单控制） |
+
+> 每个分身 = 一个独立 Matrix 账号 + 一个独立 harness 进程。分身账号的 `owner` 指向其工作责任负责人（真人），审批/吊销授权仅 Owner 可应答。
+
+### 三级授权
+
+```
+分身请求执行工具
+      │
+      ▼
+┌──────────────┐  命中红线（bash/write/edit…）  ┌──────────────────┐
+│ 红线检查?      │ ───────────────────────────▶│ L3 强制房间确认     │
+└──────┬───────┘                              │ （每次都要，不入库） │
+       │ 未命中                              └──────────────────┘
+       ▼
+┌──────────────┐  有记忆授权                    ┌──────────────────┐
+│ 记忆授权库?    │ ───────────────────────────▶│ L1 静默放行        │
+└──────┬───────┘                              └──────────────────┘
+       │ 无记录
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ L2 房间确认：推送审批 → 仅 Owner 回复「批准」有效                  │
+│   → 批准后写入记忆授权（auth-store.json），下次同类工具 L1 放行     │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ## 能力
 
 - **Matrix → DSH**：白名单用户文本经合并窗口（`..` 继续 / `!!` 立即提交 / 裸文本进合并窗口）后，通过 `agent.followup` 注入对应房间的 agent 会话；`/bind <session-id>` 可切换到已有会话
@@ -56,8 +131,10 @@ allowBuilds:
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `homeserverUrl` | 必填 | homeserver 的 client-server API base URL |
-| `accessToken` | `''` | bot access token；为空回退环境变量 `DSH_MATRIX_TOKEN`，两者都缺则插件加载失败 |
-| `userId` | 必填 | 主账号的 Matrix 用户 id（个人助手 / 主分身），如 `@ai-zhang:example.org` |
+| `accessToken` | `''` | 分身 access token；为空回退环境变量 `DSH_MATRIX_TOKEN`，两者都缺则插件加载失败 |
+| `userId` | 必填 | 本进程登录的数字分身账号，如 `@ai-niukunliang:example.org` |
+| `owner` | `''` | 工作责任负责人（真人账号，仅客户端登录）；设置后审批/吊销仅其可应答 |
+| `respondToAll` | `true` | 响应房间所有消息；设为 `false` 则仅 @提及/私聊 响应 |
 | `allowedUserIds` | `[]` | 白名单；为空且 `allowAllUsers=false` 时拒绝所有人（fail closed） |
 | `allowAllUsers` | `false` | 允许任意用户（仅开发用） |
 | `provider` | `deepseek-official` | 每个房间 agent 的 LLM provider |
@@ -66,32 +143,48 @@ allowBuilds:
 | `mergeTimeoutSecs` | `5` | 裸文本合并窗口（秒） |
 | `approvalTimeoutSecs` | `300` | 审批推送后等待聊天答复的秒数 |
 | `stateDir` | `.dsh-matrix` | 状态目录（`state.json` 房间映射 + 去重 + sync token） |
-| `digitalTwinMode` | `false` | 启用数字分身模式（解析 `digitalTwins` 列表） |
-| `digitalTwins` | `[]` | 分身账号列表，见下方示例 |
+| `digitalTwinMode` | `false` | 可选：同一进程挂载多个分身（见下方示例） |
+| `digitalTwins` | `[]` | 额外分身账号列表（通常每个分身一个进程，无需配置此项） |
 | `authStoreFile` | `auth-store.json` | 记忆授权库文件名（相对 `stateDir`） |
 | `redlineTools` | `['bash','pwsh','write','edit']` | 红线工具：即使有记忆授权也每次强制房间确认 |
 
-### 数字分身配置示例
+### 配置示例
+
+**推荐：每个分身一个 harness 进程（单账号模式）**
+
+```yaml
+# 分身 @ai-niukunliang 的 profile 配置
+userId: '@ai-niukunliang:example.org'        # 本进程登录的分身
+accessToken: '...'                            # 分身的 token（或 tokenEnv 环境变量）
+owner: '@niukunliang:example.org'             # 真人账号（仅客户端登录）：审批仅其可应答
+respondToAll: true                            # 参与房间协作，响应所有消息
+allowAllUsers: false                          # 生产建议用白名单 fail closed
+allowedUserIds: ['@niukunliang:example.org', '@tianjintao:example.org']
+```
+
+**可选：同一进程挂载多个分身（`digitalTwinMode`）**
 
 ```yaml
 digitalTwinMode: true
 digitalTwins:
-  - userId: '@ai-zhang-pm:example.org'        # 分身账号（需预先注册并取得 access token）
-    tokenEnv: 'DSH_MATRIX_AI_ZHANG_PM_TOKEN'   # 从环境变量读 token（推荐）；或直接 accessToken
-    owner: '@zhang-san:example.org'            # 工作责任负责人（主人）：仅其可在房间应答审批
-    role: 'pm'                                 # 角色标签（展示用）
-    respondToAll: false                        # 默认仅 @提及/私聊 响应；true 则响应房间所有消息
-    provider: ''                               # 留空回退顶层 provider/model
+  - userId: '@ai-niukunliang-pm:example.org'        # 分身账号（需预先注册并取得 access token）
+    tokenEnv: 'DSH_MATRIX_AI_NIUKUNLIANG_PM_TOKEN'  # 从环境变量读 token（推荐）；或直接 accessToken
+    owner: '@niukunliang:example.org'               # 工作责任负责人：仅其可在房间应答审批
+    role: 'pm'                                      # 角色标签（展示用）
+    respondToAll: false                             # 默认仅 @提及/私聊 响应；true 则响应所有消息
+    provider: ''                                    # 留空回退顶层 provider/model
     model: ''
 ```
 
-每个分身独立 sync 循环、独立状态文件（`<stateDir>/twins/<localpart>.json`）、独立 per-room agent 会话；审批按「分身×房间」维度记录记忆授权，Owner 变更不影响其他分身。分身访问控制：默认仅 Owner 本人（或 `allowAllUsers` / 白名单内用户）可驱动。
+每个分身独立 sync 循环、独立状态文件（`<stateDir>/twins/<localpart>.json`）、独立 per-room agent 会话；审批按「分身×房间」维度记录记忆授权，Owner 变更不影响其他分身。
 
 ## 使用
 
-1. 用 `dsh --profile web` 启动后，把 bot 邀请进房间（自动加入），或直接给 bot 发私聊
-2. 房间里的文本消息即注入该房间会话；回复 `批准` / `拒绝` 应答审批
-3. `dsh plugin --profile web remove dsh-matrix` 卸载；组合层变更需重启 dsh 进程（不参与 HMR）
+1. 真实人在 Matrix 客户端登录自己的账号（如 `@niukunliang`），把它加进目标房间
+2. 每个分身账号各启动一个 harness：`dsh --profile <分身profile>`，插件自动加入房间（邀请自动接受）
+3. 房间里 @提及 分身即可让它干活；分身要执行红线工具时会推送审批，**Owner 在客户端回复「批准/拒绝」**（超时按 unavailable 处理）
+4. 常用命令：`/status`（看会话）、`/auth list`（看记忆授权）、`/auth revoke <tool>`（吊销，仅 Owner）
+5. `dsh plugin --profile web remove dsh-matrix` 卸载；组合层变更需重启 dsh 进程（不参与 HMR）
 
 ## 安全红线
 
