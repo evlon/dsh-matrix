@@ -1,13 +1,24 @@
 # dsh-matrix bundle layer: inserts the Matrix bridge row into the composition.
 # Patch rows win per-row by id; the whole `config` value is replaced, not merged.
+#
+# 架构约定（每分身一个 harness 进程）：
+#   - userId      = 本进程登录的数字分身账号（分身自己）
+#   - owner       = 真实人账号（仅在 Matrix 客户端登录，不在任何 harness 登录）
+#   - 审批/吊销授权仅 owner 可应答
 - insert:
     - id: matrix
       name: dsh-matrix
       config:
         homeserverUrl: 'https://im-ipm.ict.cmcc'
+        # 本进程登录的分身账号（@ai-niukunliang 分身自己）
         userId: '@ai-niukunliang:im-ipm.ict.cmcc'
         # accessToken 留空时回退到环境变量 DSH_MATRIX_TOKEN（两者都没有则插件加载失败）
         accessToken: '9EQqkAe1sIg3ykjTkVkygsPqOVnYbb1LPb1l7Iv8lUM'
+        # 工作责任负责人：真实人账号 @niukunliang（仅在 Matrix 客户端登录）
+        # 设置后：审批/吊销仅 @niukunliang 可应答；其消息也被放行
+        owner: '@niukunliang:im-ipm.ict.cmcc'
+        # 响应房间所有消息（分身与专人/其他分身/真人同事协作）
+        respondToAll: true
         # 白名单为空且 allowAllUsers=false 时拒绝所有入站消息（fail closed）
         allowedUserIds: []
         allowAllUsers: true
@@ -17,3 +28,6 @@
         mergeTimeoutSecs: 5
         approvalTimeoutSecs: 300
         stateDir: '.dsh-matrix'
+        # 本进程只跑一个分身；其它分身（如 @ai-niukunliang-dev）请用独立 profile/进程
+        digitalTwinMode: false
+        digitalTwins: []

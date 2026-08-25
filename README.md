@@ -17,10 +17,10 @@ src/
 
 - **Matrix → DSH**：白名单用户文本经合并窗口（`..` 继续 / `!!` 立即提交 / 裸文本进合并窗口）后，通过 `agent.followup` 注入对应房间的 agent 会话；`/bind <session-id>` 可切换到已有会话
 - **DSH → Matrix**：监听 `session/event`，把 `assistant/message` 的可见文本分段（前缀 `（i/n）` 参与长度收敛）后以 `org.matrix.custom.html` 发回；`turn/start` 显示 typing
-- **多账号（数字分身）**：一个 harness 内可挂载主账号 + N 个分身（每个分身独立 Matrix 账号、独立 sync、独立会话空间）。消息路由：**@提及谁谁响应**；无提及时主账号兜底（旧行为）；纯审批词在多账号间协调归属
+- **数字分身架构**：**每个分身一个 harness 进程**——`userId` 即分身账号（bot 自己登录），`owner` 是真实人账号（仅在 Matrix 客户端登录）。分身与真人同事、其他分身在同一房间协作；@提及路由、私聊判定、多账号协调（可选 `digitalTwins` 同进程跑多分身）均已支持
 - **三级授权**：
   - **L1 记忆授权**：非红线工具此前被批准过 → 静默放行（`auth-store.json` 持久化）
-  - **L2 即时确认**：房间推送审批，分身账号**仅 Owner** 可应答，批准后写入记忆授权库
+  - **L2 即时确认**：房间推送审批，配置了 `owner` 的账号**仅 Owner** 可应答，批准后写入记忆授权库
   - **L3 红线强制**：命中 `redlineTools`（默认 `bash`/`pwsh`/`write`/`edit`）→ **每次都必须确认**，批准永不入库
 - **命令**：`/help` `/status` `/new` `/clear` `/bind <session-id>` `/auth list` `/auth revoke <tool>` `/auth revoke-all`
 - **可靠性**：事件 id 持久去重环、sync token 落盘重启续传、长回复 HTML 失败回退纯文本、sync 循环指数退避

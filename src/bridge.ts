@@ -111,7 +111,7 @@ export class AccountBridge {
     this.userId = account.userId
     this.isMain = account.userId === config.userId
     this.owner = account.owner !== '' ? account.owner : undefined
-    // 主账号默认响应全部消息（个人助手模式）；分身默认仅 @提及 或私聊。
+    // 响应策略：显式 respondToAll 优先；主账号兜底 true（旧行为）。
     this.respondToAll = account.respondToAll || this.isMain
     this.agentOptions = {
       provider: account.provider !== '' ? account.provider : config.provider,
@@ -172,7 +172,7 @@ export class AccountBridge {
 
   private authorized(sender: string): boolean {
     if (this.config.allowAllUsers) return true
-    if (!this.isMain && sender === this.owner) return true
+    if (this.owner !== undefined && sender === this.owner) return true
     return this.config.allowedUserIds.includes(sender)
   }
 
@@ -260,12 +260,12 @@ export class AccountBridge {
       const stripped = text.replace(/@[a-z0-9._-]+(?::[a-z0-9._-]+)?/gi, '').trim()
 
       // 审批应答最优先（不受 @提及/私聊 路由门控限制）：
-      // 非主账号时仅 Owner 可应答；非 Owner 的应答直接忽略。
+      // 配置了 owner 时仅 Owner 可应答；未配置 owner 时任意白名单用户可应答（旧行为）。
       const queue = this.pendingApprovals.get(message.roomId)
       const first = queue?.[0]
       const isApprovalWord = APPROVE_RE.test(stripped) || DENY_RE.test(stripped)
       if (first !== undefined && isApprovalWord) {
-        if (!this.isMain && message.sender !== this.owner) {
+        if (this.owner !== undefined && message.sender !== this.owner) {
           this.ctx.logger.warn('[dsh-matrix] approval reply from %s ignored (only %s may answer)', message.sender, this.owner)
           return
         }
@@ -399,7 +399,7 @@ export class AccountBridge {
             break
           }
           case 'revoke': {
-            if (!this.isMain && sender !== this.owner) {
+            if (this.owner !== undefined && sender !== this.owner) {
               await reply('❌ 只有 Owner 可以吊销授权。')
               break
             }
@@ -413,7 +413,7 @@ export class AccountBridge {
             break
           }
           case 'revoke-all': {
-            if (!this.isMain && sender !== this.owner) {
+            if (this.owner !== undefined && sender !== this.owner) {
               await reply('❌ 只有 Owner 可以吊销授权。')
               break
             }
@@ -571,14 +571,15 @@ export class MatrixBridge {
     // 共享「房间有 pending 审批」集合：多账号协调审批应答归属。
     const pendingRooms = new Set<string>()
 
-    // 1. 挂载主账号（保持 state.json 名字，向后兼容）
+    // 1. 挂载主账号（保持 state.json 名字，向后兼容）。
+    //    按用户架构：userId 即数字分身自己，owner 是真实人账号（仅在 Matrix 客户端登录）。
     const mainAccount: DigitalTwinAccount = {
       userId: config.userId,
       accessToken: config.accessToken,
       tokenEnv: '',
-      owner: '',
+      owner: config.owner ?? '',
       role: 'main',
-      respondToAll: true,
+      respondToAll: config.respondToAll,
       provider: config.provider,
       model: config.model,
     }

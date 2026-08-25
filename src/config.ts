@@ -28,12 +28,16 @@ export interface Config {
   homeserverUrl: string
   /** 主账号 access token；为空时回退到环境变量 DSH_MATRIX_TOKEN。 */
   accessToken: string
-  /** 主账号 Matrix 用户 id（通常是员工自己的数字主分身或个人助手）。 */
+  /** 主账号 Matrix 用户 id（数字分身自己；真实人账号不在 harness 登录）。 */
   userId: string
   /** 允许与 bot 对话的 Matrix 用户 id 白名单；为空且 allowAllUsers=false 时拒绝所有人。 */
   allowedUserIds: string[]
   /** 允许任意用户（仅开发用）。 */
   allowAllUsers: boolean
+  /** 工作责任负责人（真实人账号，仅在 Matrix 客户端登录）：设置后本账号审批仅其可应答。 */
+  owner: string
+  /** 是否响应房间里所有消息；默认 true（分身也可设为 false 仅 @提及响应）。 */
+  respondToAll: boolean
   /** 默认 LLM provider 路由（分身未指定时使用）。 */
   provider: string
   /** 默认模型 id（分身未指定时使用）。 */
@@ -64,6 +68,8 @@ export const Config: Schema<Config> = Schema.object({
   userId: Schema.string().required(),
   allowedUserIds: Schema.array(Schema.string()).default([]),
   allowAllUsers: Schema.boolean().default(false),
+  owner: Schema.string().default(''),
+  respondToAll: Schema.boolean().default(true),
   provider: Schema.string().default('deepseek-official'),
   model: Schema.string().default('deepseek-v4-flash'),
   chunkMaxChars: Schema.number().default(4000),
