@@ -22,8 +22,8 @@
         # 白名单为空且 allowAllUsers=false 时拒绝所有入站消息（fail closed）
         allowedUserIds: []
         allowAllUsers: true
-        provider: 'sharkai'
-        model: 'deepseek-v4-flash'
+        provider: 'volces'
+        model: 'deepseek-v4-flash-ga-260731'
         # room agent 挂载的 agent preset：standard 提供完整工具（bash/pwsh/fs/…）。
         # 缺失会导致 agent 无任何工具，模型只能把工具调用写成文本（无法真正执行）。
         agentPreset: 'standard'
