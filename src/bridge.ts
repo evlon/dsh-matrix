@@ -97,6 +97,8 @@ export class AccountBridge {
   private readonly pendingRooms: Set<string>
 
   private readonly roomAgents = new Map<string, AgentHandle>()
+  /** 并发单飞锁：避免同一 roomId 的消息同时进入 getRoomAgent 时重复创建会话。 */
+  private readonly roomAgentInflight = new Map<string, Promise<Agent>>()
   private readonly mergeBuffers = new Map<string, MergeBuffer>()
   private readonly pendingApprovals = new Map<string, PendingApproval[]>()
 
@@ -153,6 +155,7 @@ export class AccountBridge {
   async stop(): Promise<void> {
     const handles = [...this.roomAgents.values()]
     this.roomAgents.clear()
+    this.roomAgentInflight.clear()
     await Promise.allSettled(handles.map((handle) => handle.dispose()))
     await this.channel.stop()
     await this.state.dispose()
@@ -215,10 +218,24 @@ export class AccountBridge {
     return this.state.sessionRoom(sessionId)
   }
 
-  private async getRoomAgent(roomId: string): Promise<Agent> {
+  private getRoomAgent(roomId: string): Promise<Agent> {
+    // 已建立：直接返回缓存的 agent。
     const existing = this.roomAgents.get(roomId)
-    if (existing !== undefined) return existing.agent
+    if (existing !== undefined) return Promise.resolve(existing.agent)
 
+    // 并发单飞：同一 roomId 同时到达的多条消息复用同一个建连 promise，
+    // 杜绝对同一个确定性 sessionId 并发 create 导致 "while it is live"。
+    const inflight = this.roomAgentInflight.get(roomId)
+    if (inflight !== undefined) return inflight
+
+    const promise = this.createRoomAgent(roomId).finally(() => {
+      this.roomAgentInflight.delete(roomId)
+    })
+    this.roomAgentInflight.set(roomId, promise)
+    return promise
+  }
+
+  private async createRoomAgent(roomId: string): Promise<Agent> {
     // 优先 resume 历史绑定（旧随机 id 会话的迁移路径）。
     const binding = this.state.roomSession(roomId)
     if (binding !== undefined) {
@@ -234,15 +251,29 @@ export class AccountBridge {
       }
     }
 
-    // 确定性会话 id：同一房间永远同一 id。agents.create 语义为——
-    // 首次创建；重挂载且持久化已存在时自动恢复历史（见 dsh-agent-loop README）。
-    // 这样重启后同一房间回到同一会话，GUI 不再堆积多个"会话"。
+    // 确定性会话 id：同一房间永远同一 id。agents.create 语义为首次创建；
+    // 若该 id 在当前 harness 进程/持久化里已存在，create 会抛错：
+    //   - "already exists"：store 中已有该会话；
+    //   - "while it is live"：并发或残留导致同一 id 已成 live 会话。
+    // 两种都改为 resume 复用既有会话（历史、GUI 会话都在），而不是报错退出，
+    // 也不是新建第二个。这样重启后同一房间回到同一会话，GUI 不再堆积多个"会话"。
     const sessionId = SessionId(`matrix-${localpartOf(this.userId)}-${stableHash(roomId)}`)
-    const handle = await this.ctx.agents.create({
-      sessionId,
-      meta: { cwd: process.cwd(), agentPreset: this.config.agentPreset ?? 'standard' },
-      agentOptions: this.agentOptions,
-    })
+    let handle: AgentHandle
+    try {
+      handle = await this.ctx.agents.create({
+        sessionId,
+        meta: { cwd: process.cwd(), agentPreset: this.config.agentPreset ?? 'standard' },
+        agentOptions: this.agentOptions,
+      })
+    } catch (error) {
+      const reason = messageOf(error)
+      if (!reason.includes('already exists') && !reason.includes('while it is live')) throw error
+      this.ctx.logger.warn('[dsh-matrix] session %s already live/exist (%s); resuming instead of recreating', sessionId, reason)
+      handle = await this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions: this.agentOptions,
+      })
+    }
     this.roomAgents.set(roomId, handle)
     this.state.setRoomSession(roomId, handle.agent.id)
     // 会话标题 = Matrix 房间名（pin 住，自动标题不再覆盖）。
@@ -266,6 +297,7 @@ export class AccountBridge {
 
   private async releaseRoom(roomId: string): Promise<void> {
     const handle = this.roomAgents.get(roomId)
+    this.roomAgentInflight.delete(roomId)
     if (handle !== undefined) {
       this.roomAgents.delete(roomId)
       await handle.dispose()
