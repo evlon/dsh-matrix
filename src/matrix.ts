@@ -13,6 +13,7 @@
 
 import { randomUUID } from 'node:crypto'
 import type { BridgeState } from './store.js'
+import { getDiag } from './diag.js'
 
 /**
  * Matrix 媒体附件的归一化结构（入站扩展点）。
@@ -56,6 +57,28 @@ export interface ChannelOptions {
   readonly sleep?: (ms: number) => Promise<void>
 }
 
+/** 群成员信息（joined_members 投影）。 */
+export interface MatrixMember {
+  readonly userId: string
+  readonly displayName?: string
+  readonly avatarUrl?: string
+}
+
+/** 用户资料（profile API 投影）。 */
+export interface MatrixUserInfo {
+  readonly userId: string
+  readonly displayName?: string
+  readonly avatarUrl?: string
+}
+
+/** 房间消息投影（/messages API 精简投影）。 */
+export interface MatrixRoomMessage {
+  readonly eventId: string
+  readonly sender: string
+  readonly body: string
+  readonly timestamp: number
+}
+
 export interface Channel {
   start(): Promise<void>
   stop(): Promise<void>
@@ -67,6 +90,12 @@ export interface Channel {
   getRoomName?(roomId: string): Promise<string | undefined>
   /** 房间当前成员数（joined_members）。仅用于群聊上下文标签，绝不全量注入消息。 */
   getRoomMemberCount?(roomId: string): Promise<number | undefined>
+  /** 房间当前成员列表（joined_members）。供 agent 工具按需调用。 */
+  getRoomMembers?(roomId: string): Promise<MatrixMember[] | undefined>
+  /** 用户资料（displayname/avatar_url）。供 agent 工具按需调用。 */
+  getUserInfo?(userId: string): Promise<MatrixUserInfo | undefined>
+  /** 房间最近消息（/messages API，正序）。供 agent 工具按需调用。 */
+  getRecentMessages?(roomId: string, limit?: number): Promise<MatrixRoomMessage[]>
 }
 
 /** /sync 响应中我们关心的最小结构。 */
@@ -101,15 +130,20 @@ const BASE_BACKOFF_MS = 1000
 const DM_CACHE_TTL_MS = 60_000
 const NAME_CACHE_TTL_MS = 5 * 60_000
 const COUNT_CACHE_TTL_MS = 5 * 60_000
+const MEMBERS_CACHE_TTL_MS = 5 * 60_000
+const USER_INFO_CACHE_TTL_MS = 10 * 60_000
 
 export class MatrixChannel implements Channel {
   private readonly baseUrl: string
   private readonly fetchFn: typeof fetch
   private readonly sleepFn: (ms: number) => Promise<void>
+  private readonly diag = getDiag('dsh-matrix')
   private readonly warnedEncrypted = new Set<string>()
   private readonly dmCache = new Map<string, { isDm: boolean; at: number }>()
   private readonly nameCache = new Map<string, { name?: string; at: number }>()
   private readonly countCache = new Map<string, { count: number | undefined; at: number }>()
+  private readonly membersCache = new Map<string, { value: MatrixMember[]; at: number }>()
+  private readonly userInfoCache = new Map<string, { value: MatrixUserInfo; at: number }>()
   private stopped = false
   private loop: Promise<void> | undefined
   private lifecycleAbort: AbortController | undefined
@@ -286,15 +320,20 @@ export class MatrixChannel implements Channel {
     if (cached !== undefined && Date.now() - cached.at < NAME_CACHE_TTL_MS) return cached.name
     try {
       const url = `${this.baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/m.room.name`
+      this.diag.log(`[dsh-matrix:matrix] GET ${url.replace(this.baseUrl, '')} room=${roomId}`)
       const response = await this.fetchFn(url, {
         headers: { Authorization: `Bearer ${this.options.accessToken}` },
       })
-      if (!response.ok) return undefined
+      if (!response.ok) {
+        this.diag.log(`[dsh-matrix:matrix]   <- HTTP ${response.status} ${response.statusText}`)
+        return undefined
+      }
       const data = (await response.json()) as { name?: string }
       const name = typeof data.name === 'string' && data.name.trim() !== '' ? data.name.trim() : undefined
       this.nameCache.set(roomId, { name, at: Date.now() })
       return name
-    } catch {
+    } catch (err) {
+      this.diag.log(`[dsh-matrix:matrix]   !! getRoomName room=${roomId} err=${err instanceof Error ? err.message : String(err)}`)
       return undefined
     }
   }
@@ -305,16 +344,128 @@ export class MatrixChannel implements Channel {
     if (cached !== undefined && Date.now() - cached.at < COUNT_CACHE_TTL_MS) return cached.count
     try {
       const url = `${this.baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/joined_members`
+      this.diag.log(`[dsh-matrix:matrix] GET .../joined_members room=${roomId} (count)`)
       const response = await this.fetchFn(url, {
         headers: { Authorization: `Bearer ${this.options.accessToken}` },
       })
-      if (!response.ok) return undefined
+      if (!response.ok) {
+        this.diag.log(`[dsh-matrix:matrix]   <- HTTP ${response.status}`)
+        return undefined
+      }
       const data = (await response.json()) as { joined?: Record<string, unknown> }
       const count = data.joined === undefined ? undefined : Object.keys(data.joined).length
       this.countCache.set(roomId, { count, at: Date.now() })
       return count
-    } catch {
+    } catch (err) {
+      this.diag.log(`[dsh-matrix:matrix]   !! getRoomMemberCount room=${roomId} err=${err instanceof Error ? err.message : String(err)}`)
       return undefined
+    }
+  }
+
+  /** 房间当前成员列表（joined_members）。带 TTL 缓存，供 agent 工具按需调用。 */
+  async getRoomMembers(roomId: string): Promise<MatrixMember[] | undefined> {
+    const cached = this.membersCache.get(roomId)
+    if (cached !== undefined && Date.now() - cached.at < MEMBERS_CACHE_TTL_MS) return cached.value
+    try {
+      const url = `${this.baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/joined_members`
+      this.diag.log(`[dsh-matrix:matrix] GET .../joined_members room=${roomId} (members)`)
+      const response = await this.fetchFn(url, {
+        headers: { Authorization: `Bearer ${this.options.accessToken}` },
+      })
+      if (!response.ok) {
+        this.diag.log(`[dsh-matrix:matrix]   <- HTTP ${response.status}`)
+        return undefined
+      }
+      // joined 的键就是完整 user id（@user:server），值含 display_name/avatar_url。
+      const data = (await response.json()) as {
+        joined?: Record<string, { display_name?: string; avatar_url?: string }>
+      }
+      const joined = data.joined ?? {}
+      const members: MatrixMember[] = Object.entries(joined).map(([userId, info]) => ({
+        userId,
+        ...(typeof info?.display_name === 'string' && info.display_name !== '' ? { displayName: info.display_name } : {}),
+        ...(typeof info?.avatar_url === 'string' && info.avatar_url !== '' ? { avatarUrl: info.avatar_url } : {}),
+      }))
+      this.membersCache.set(roomId, { value: members, at: Date.now() })
+      this.diag.log(`[dsh-matrix:matrix]   <- ${members.length} members`)
+      return members
+    } catch (err) {
+      this.diag.log(`[dsh-matrix:matrix]   !! getRoomMembers room=${roomId} err=${err instanceof Error ? err.message : String(err)}`)
+      return undefined
+    }
+  }
+
+  /** 用户资料（profile API）。带 TTL 缓存，供 agent 工具按需调用；失败返回 undefined。 */
+  async getUserInfo(userId: string): Promise<MatrixUserInfo | undefined> {
+    const cached = this.userInfoCache.get(userId)
+    if (cached !== undefined && Date.now() - cached.at < USER_INFO_CACHE_TTL_MS) return cached.value
+    try {
+      const url = `${this.baseUrl}/_matrix/client/v3/profile/${encodeURIComponent(userId)}`
+      this.diag.log(`[dsh-matrix:matrix] GET .../profile/${userId}`)
+      const response = await this.fetchFn(url, {
+        headers: { Authorization: `Bearer ${this.options.accessToken}` },
+      })
+      if (!response.ok) {
+        this.diag.log(`[dsh-matrix:matrix]   <- HTTP ${response.status}`)
+        return undefined
+      }
+      const data = (await response.json()) as { displayname?: string; avatar_url?: string }
+      const info: MatrixUserInfo = {
+        userId,
+        ...(typeof data.displayname === 'string' && data.displayname !== '' ? { displayName: data.displayname } : {}),
+        ...(typeof data.avatar_url === 'string' && data.avatar_url !== '' ? { avatarUrl: data.avatar_url } : {}),
+      }
+      this.userInfoCache.set(userId, { value: info, at: Date.now() })
+      return info
+    } catch (err) {
+      this.diag.log(`[dsh-matrix:matrix]   !! getUserInfo user=${userId} err=${err instanceof Error ? err.message : String(err)}`)
+      return undefined
+    }
+  }
+
+  /** 房间最近消息（/messages API，按时间正序返回）。默认 20 条，最多 100 条。 */
+  async getRecentMessages(roomId: string, limit = 20): Promise<MatrixRoomMessage[]> {
+    try {
+      const url = new URL(`${this.baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/messages`)
+      url.searchParams.set('dir', 'b')
+      url.searchParams.set('limit', String(Math.max(1, Math.min(limit, 100))))
+      this.diag.log(`[dsh-matrix:matrix] GET .../messages room=${roomId} limit=${limit}`)
+      const response = await this.fetchFn(url, {
+        headers: { Authorization: `Bearer ${this.options.accessToken}` },
+      })
+      if (!response.ok) {
+        this.diag.log(`[dsh-matrix:matrix]   <- HTTP ${response.status}`)
+        return []
+      }
+      const data = (await response.json()) as {
+        chunk?: Array<{
+          event_id?: string
+          sender?: string
+          origin_server_ts?: number
+          type?: string
+          content?: { body?: string; msgtype?: string }
+        }>
+      }
+      const chunk = data.chunk ?? []
+      const messages: MatrixRoomMessage[] = []
+      // /messages?dir=b 返回反序（新→旧），reverse 后为正序（旧→新）。
+      for (const event of chunk.reverse()) {
+        if (event.type !== 'm.room.message') continue
+        if (event.sender === this.options.userId) continue
+        const body = event.content?.body
+        if (typeof body !== 'string' || body.trim() === '') continue
+        messages.push({
+          eventId: event.event_id ?? '',
+          sender: event.sender ?? '',
+          body: body.trim(),
+          timestamp: event.origin_server_ts ?? 0,
+        })
+      }
+      this.diag.log(`[dsh-matrix:matrix]   <- chunk=${chunk.length} filtered=${messages.length}`)
+      return messages
+    } catch (err) {
+      this.diag.log(`[dsh-matrix:matrix]   !! getRecentMessages room=${roomId} err=${err instanceof Error ? err.message : String(err)}`)
+      return []
     }
   }
 

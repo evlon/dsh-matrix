@@ -106,13 +106,13 @@ function makeCtx() {
       agents: {
         get() { return undefined },
         async create({ sessionId }) {
-          const agent = { id: sessionId, status: 'idle', session: { id: sessionId }, followup(message) { captured.messages.push(message) } }
+          const agent = { id: sessionId, status: 'idle', ctx: { systemPrompt: { tools() {} } }, session: { id: sessionId }, followup(message) { captured.messages.push(message) } }
           const handle = { agent, async dispose() {} }
           captured.agents.push(handle)
           return handle
         },
         async resume({ resumeSessionId }) {
-          const agent = { id: resumeSessionId, status: 'idle', session: { id: resumeSessionId }, followup(message) { captured.messages.push(message) } }
+          const agent = { id: resumeSessionId, status: 'idle', ctx: { systemPrompt: { tools() {} } }, session: { id: resumeSessionId }, followup(message) { captured.messages.push(message) } }
           const handle = { agent, async dispose() {} }
           captured.agents.push(handle)
           return handle
@@ -176,9 +176,8 @@ test('multi-account + owner auth: twin approval, auth commands, routing', async 
     // 1) 群聊必须 @提及 才响应：主账号被 @ 后响应；用 !! 立即提交，避免 5s 合并窗口拖慢测试
     hs.deliver([textEvent('$m1', '@bot-main 你好!!')])
     await waitFor(() => captured.messages.length === 1, 'main responds')
-    // 注入格式：群聊标签 + 最近对话上下文（含本条原始消息）+ 当前消息（已剥 @提及）
-    assert.match(captured.messages[0].content[0].text,
-      /^\[群聊「数智化部全员群」，你是@bot-main\]\n【本群最近对话（未 @你 的你也可能需要的上下文）】\n- @alice:hs\.example: @bot-main 你好!!\n\n【当前消息】\n你好$/)
+    // 注入格式：群聊标签 + 当前消息（已剥 @提及）；群聊历史已改由工具按需获取
+    assert.match(captured.messages[0].content[0].text, /^\[群聊「数智化部全员群」，你是@bot-main\]\n你好$/)
     captured.messages.length = 0
 
     // 1.5) 会话标题 = Matrix 房间名（rename 被调用且标题正确）

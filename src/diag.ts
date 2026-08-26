@@ -6,18 +6,22 @@ import { join } from 'node:path'
  * 不必依赖 dsh web 运行终端。写入 stateDir/diagnostics.log，按行追加，进程级单例。
  */
 export class DiagLogger {
-  private readonly file: string | undefined
+  private file: string | undefined
   private readonly mem: string[] = []
   private readonly maxMem = 500
 
   constructor(private readonly name: string, stateDir?: string) {
-    if (stateDir) {
-      try {
-        mkdirSync(stateDir, { recursive: true })
-        this.file = join(stateDir, 'diagnostics.log')
-      } catch {
-        this.file = undefined
-      }
+    this.attachFile(stateDir)
+  }
+
+  /** 后补挂载文件（单例可能先于拿到 stateDir 的调用方创建）。 */
+  attachFile(stateDir?: string): void {
+    if (this.file || !stateDir) return
+    try {
+      mkdirSync(stateDir, { recursive: true })
+      this.file = join(stateDir, 'diagnostics.log')
+    } catch {
+      this.file = undefined
     }
   }
 
@@ -46,5 +50,6 @@ let shared: DiagLogger | undefined
 
 export function getDiag(name: string, stateDir?: string): DiagLogger {
   if (!shared) shared = new DiagLogger(name, stateDir)
+  else shared.attachFile(stateDir)
   return shared
 }

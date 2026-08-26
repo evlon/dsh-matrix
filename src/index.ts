@@ -25,10 +25,11 @@ export * from './config.js'
 export * from './format.js'
 export * from './matrix.js'
 export * from './store.js'
+export * from './tools.js'
 
 export const name = 'matrix'
-/** 只需要 agent 工厂；LLM 适配器、会话与工具由外围 cordis.yml 组合提供。 */
-export const inject = ['agents']
+/** 只需要 agent 工厂 + tools 注册；LLM 适配器、会话与工具由外围 cordis.yml 组合提供。 */
+export const inject = ['agents', 'tools']
 
 export function apply(ctx: Context, config: MatrixConfig): void {
   const token = config.accessToken === '' ? process.env.DSH_MATRIX_TOKEN : config.accessToken

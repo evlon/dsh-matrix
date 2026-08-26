@@ -224,6 +224,8 @@ export class AccountBridge {
   private readonly pendingRooms: Set<string>
 
   private readonly roomAgents = new Map<string, AgentHandle>()
+  /** Matrix 工具是否已注册进 ToolRuntime（全局一次，主账号负责）。 */
+  private toolsRegistered = false
   /** 并发单飞锁：避免同一 roomId 的消息同时进入 getRoomAgent 时重复创建会话。 */
   private readonly roomAgentInflight = new Map<string, Promise<Agent>>()
   private readonly mergeBuffers = new Map<string, MergeBuffer>()
@@ -312,7 +314,41 @@ export class AccountBridge {
     for (const [roomId, tasks] of Object.entries(this.state.matrixTasksSnapshot())) {
       this.matrixTasks.set(roomId, tasks)
     }
+    // Matrix 专属工具：注册到 ToolRuntime（全局 layer），所有 agent 可见可调用。
+    // 幂等守卫：多账号（主 + 分身）共享同一 ctx，只有主账号注册一次。
+    if (this.isMain && !this.toolsRegistered) {
+      this.toolsRegistered = true
+      this.registerToolsOnce()
+    }
     await this.connectWithRetry()
+  }
+
+  /**
+   * 通过 ctx.tools.register(defineTool(...)) 把 4 个 Matrix 工具注册进 ToolRuntime。
+   * 与旧的 systemPrompt.tools() 方式的本质区别：ToolRuntime 同时持有 schema 与
+   * 执行体，模型既能看到工具也能真正执行；systemPrompt 的 provider 只投影 schema，
+   * 调用时会报 unknown tool。roomId 绑定改为 execute 时通过 exec.agent.id 反查，
+   * 不再需要 per-agent 注册。
+   */
+  private registerToolsOnce(): void {
+    if (this.config.matrixTools === false) return
+    if (this.ctx.get('tools') === undefined) {
+      this.ctx.logger.warn('[dsh-matrix] tools service unavailable; matrix tools not registered')
+      return
+    }
+    void import('./tools.js').then(({ applyMatrixTools, setToolLogger }) => {
+      setToolLogger((message: string, ...args: unknown[]) => {
+        const rest = args.length > 0 ? ' ' + args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ') : ''
+        this.diag.log(`${message}${rest}`)
+      })
+      applyMatrixTools(this.ctx, {
+        channel: this.channel as MatrixChannel,
+        roomForSession: (sessionId: string) => this.roomForSession(sessionId),
+      })
+      this.ctx.logger.info('[dsh-matrix] matrix tools registered into ToolRuntime')
+    }).catch((error: unknown) => {
+      this.ctx.logger.error('[dsh-matrix] matrix tools registration failed: %s', messageOf(error))
+    })
   }
 
   async stop(): Promise<void> {
@@ -428,53 +464,54 @@ export class AccountBridge {
   }
 
   private async createRoomAgent(roomId: string): Promise<Agent> {
-    // 内核已把某 session 恢复为 live 时，ctx.agents.get 返回 Agent（无 dispose 包装）。
-    // 这里包成 AgentHandle，与本函数其余路径（create/resume 返回的 AgentHandle）一致，
-    // 使 roomAgents 缓存与末尾 return handle.agent 逻辑统一。
-    const asHandle = (agent: Agent): AgentHandle => ({ agent, dispose: async () => {} })
+    const cwd = this.state.roomCwd(roomId) ?? (this.config.cwdCandidates ?? [])[0] ?? process.cwd()
 
-    // 优先 resume 历史绑定（旧随机 id 会话的迁移路径）。
-    const binding = this.state.roomSession(roomId)
-    if (binding !== undefined) {
-      const bindingId = SessionId(binding)
-      // 内核启动可能已将该 session 恢复为 live，直接取用，避免重复 prepare。
-      const liveBinding = this.ctx.agents.get(bindingId)
-      if (liveBinding !== undefined) {
-        const handle = asHandle(liveBinding)
-        this.roomAgents.set(roomId, handle)
-        return handle.agent
-      }
+    let handle: AgentHandle | undefined
+    const bindingId = this.state.roomSession(roomId)
+    if (bindingId !== undefined) {
       try {
-        const handle = await this.ctx.agents.resume({
-          resumeSessionId: bindingId,
+        handle = await this.ctx.agents.resume({
+          resumeSessionId: SessionId(bindingId),
           agentOptions: this.agentOptions,
           setup: this.agentSetup(),
         })
-        this.roomAgents.set(roomId, handle)
-        return handle.agent
       } catch (error) {
         const reason = messageOf(error)
-        // 内核并发恢复导致已 live：取用内核已有会话，而非报错退出。
+        // 内核并发恢复导致已 live：直接取用（工具已全局注册，无需 setup 注入）。
         if (reason.includes('while it is live')) {
-          const live = this.ctx.agents.get(bindingId)
+          const live = this.ctx.agents.get(SessionId(bindingId))
           if (live !== undefined) {
-            const handle = asHandle(live)
-            this.roomAgents.set(roomId, handle)
-            return handle.agent
+            handle = { agent: live, dispose: async () => {} }
           }
         }
-        this.ctx.logger.warn('[dsh-matrix] resume %s failed (%s); falling back to deterministic id', binding, reason)
+        if (handle === undefined) {
+          this.ctx.logger.warn('[dsh-matrix] resume %s failed (%s); using deterministic id', bindingId, reason)
+        }
       }
     }
 
-    // 确定性会话 id：同一房间永远同一 id。
-    // dsh web / GUI 启动时会主动恢复所有持久化会话使其成为 live，因此该 id 可能
-    // 已被内核加载并注册到 agents 表。先用既有 live agent：避免重复 create/resume
-    // 撞 "already exists" / "while it is live" / "id collision"。
-    const sessionId = SessionId(`matrix-${localpartOf(this.userId)}-${stableHash(roomId)}`)
-    const handle = await this.acquireAgent(sessionId, {
-      cwd: this.state.roomCwd(roomId) ?? (this.config.cwdCandidates ?? [])[0] ?? process.cwd(),
-    })
+    // 确定性会话 id：同一房间、同一代数下永远同一 id。
+    // 代数（epoch）使 /clear 或损坏历史重建后生成全新 id，避免 resume 到旧会话。
+    if (handle === undefined) {
+      const epoch = this.state.sessionEpoch(roomId)
+      const suffix = epoch > 0 ? `-e${epoch}` : ''
+      const sessionId = SessionId(`matrix-${localpartOf(this.userId)}-${stableHash(roomId)}${suffix}`)
+      handle = await this.acquireAgent(sessionId, { cwd })
+    }
+
+    // 损坏历史自愈：若会话历史里存在「孤立 tool-result」（前面没有带 tool_calls
+    // 的 assistant 消息），说明上一代会话遗留了坏数据（常见于工具注册成功前的
+    // 失败调用被额外 append）。此时丢弃该会话、代数 +1、用新 id 重建，否则每次
+    // 请求都会被 LLM API 以 INVALID_REQUEST 拒绝。
+    if (this.sessionHasOrphanToolResult(handle.agent)) {
+      this.ctx.logger.warn('[dsh-matrix] session %s has orphan tool-result history; rebuilding with new epoch (room=%s)', handle.agent.id, roomId)
+      await handle.dispose().catch(() => {})
+      this.state.deleteRoom(roomId)
+      const nextEpoch = this.state.bumpSessionEpoch(roomId)
+      const sessionId = SessionId(`matrix-${localpartOf(this.userId)}-${stableHash(roomId)}-e${nextEpoch}`)
+      handle = await this.acquireAgent(sessionId, { cwd })
+    }
+
     this.roomAgents.set(roomId, handle)
     this.state.setRoomSession(roomId, handle.agent.id)
     // 会话标题 = Matrix 房间名（pin 住，自动标题不再覆盖）。
@@ -483,10 +520,45 @@ export class AccountBridge {
   }
 
   /**
+   * 检测会话历史里是否有「孤立 tool-result」：某条 user 消息带 tool-result 内容块，
+   * 但往前最近的 assistant 消息没有 tool_calls（或没有声明足够的 tool_call）。
+   * 这种历史会让 LLM API 拒绝请求（Messages with role 'tool' must be a response to
+   * a preceding message with 'tool_calls'）。
+   */
+  private sessionHasOrphanToolResult(agent: Agent): boolean {
+    try {
+      const session = (agent as unknown as { session?: { deriveMessages?(): unknown[] } }).session
+      if (!session || typeof session.deriveMessages !== 'function') return false
+      const messages = session.deriveMessages()
+      let openCalls = 0
+      for (const message of messages) {
+        const m = message as { role?: string; content?: Array<{ type: string }>; tool_calls?: unknown[] } | undefined
+        if (!m || typeof m !== 'object') continue
+        if (m.role === 'assistant') {
+          openCalls += Array.isArray(m.tool_calls) ? m.tool_calls.length : 0
+          continue
+        }
+        const toolResults = Array.isArray(m.content) ? m.content.filter((c) => c.type === 'tool-result').length : 0
+        if (toolResults > openCalls) return true
+        openCalls = Math.max(0, openCalls - toolResults)
+      }
+      return false
+    } catch (error) {
+      this.ctx.logger.warn('[dsh-matrix] orphan tool-result check failed: %s', messageOf(error))
+      return false
+    }
+  }
+
+  /**
    * 构建 agent 的 setup 回调：在 agent scope 上 compose 配置指定的 preset，使
    * shell/file/检索/skills 等工具挂载到该 agent。harness 的 GUI 会话由 host 自动注入
    * 此 setup；dsh-matrix 直接走 ctx.agents.create/resume（底层 factory），必须自己传
-   * setup，否则 agent 不 compose 任何 preset → 工具不可见（agent 侧报 "unknown tool"）。
+   * setup，否则 agent 不 compose 任何 preset → 工具不可见。
+   *
+   * 注意：matrix 专属工具（matrix_get_room_members 等）不在此注册，而是在
+   * start() 里通过 applyMatrixTools 一次性注册到全局 ToolRuntime layer。
+   * 原因：ToolRuntime.register() 始终写入全局 layer（scopeOf(rootCtx)===undefined），
+   * 与 setup 的 agentCtx 无关；execute 时通过 exec.agent.id 反查房间。
    */
   private agentSetup(): (agentCtx: Context) => Promise<void> {
     const preset = this.config.agentPreset ?? 'standard'
@@ -591,6 +663,9 @@ export class AccountBridge {
       this.roomAgents.delete(roomId)
       await handle.dispose()
     }
+    // 代数 +1：下一次 createRoomAgent 生成全新的确定性会话 id，
+    // 不再 resume 旧的（可能带损坏历史）会话。
+    this.state.bumpSessionEpoch(roomId)
     this.state.deleteRoom(roomId)
     this.settleAll(roomId, 'unavailable')
     const buffer = this.mergeBuffers.get(roomId)
@@ -775,31 +850,12 @@ export class AccountBridge {
     return label
   }
 
-  /**
-   * 群聊最近一周的对话上下文（供分身被人 @ 时回溯/引用）。纯文本，按时间升序，
-   * 最多取最近 40 条，单条过长截断。返回空字符串表示无上下文。token 与群人数无关。
-   */
-  private groupChatContext(roomId: string, max = 40, maxLine = 200): string {
-    const recent = this.chatlog.recent(roomId, max)
-    if (recent.length === 0) return ''
-    const lines = recent.map((e) => {
-      const t = e.text.length > maxLine ? e.text.slice(0, maxLine) + '…' : e.text
-      return `- ${e.sender}: ${t}`
-    })
-    return `【本群最近对话（未 @你 的你也可能需要的上下文）】\n${lines.join('\n')}`
-  }
-
   private async deliver(roomId: string, text: string, sender?: string): Promise<void> {
     const agent = await this.getRoomAgent(roomId)
     // 群聊上下文：群名+人数+身份一行前缀，避免 agent 误把群消息当私聊对话。
+    // 仅注入房间标签（约 1 行）；完整群聊历史已改由 matrix_get_recent_messages 工具按需获取。
     const label = await this.roomContextLabel(roomId)
-    let body = `${label}\n${text}`
-    // 群聊里：当本条是触发分身的消息时，附上最近一周对话上下文，便于引用前置消息。
-    const isDm = this.channel.isDirectRoom ? await this.channel.isDirectRoom(roomId) : false
-    if (!isDm) {
-      const ctx = this.groupChatContext(roomId)
-      if (ctx) body = `${label}\n${ctx}\n\n【当前消息】\n${text}`
-    }
+    const body = `${label}\n${text}`
     agent.followup(createUserMessage({
       content: [{ type: 'text', text: body }],
       source: {
@@ -1128,110 +1184,133 @@ export class AccountBridge {
   /** ---------- 出站投递 ---------- */
 
   handleSessionEvent(session: Session, event: SessionEvent): void {
-    const roomId = this.roomForSession(session.id)
-    if (roomId === undefined) return
-    const verbosity = this.roomVerbosity.get(roomId) ?? 'result'
-    const data = event.data as any
-    // 用 string 比较放宽收窄，兼容宿主未导出的 'llm/retry' 等事件类型。
-    switch (event.type as string) {
-      case 'turn/start':
-        void this.channel.sendTyping(roomId, true).catch((error: unknown) => {
-          this.ctx.logger.warn('[dsh-matrix] typing failed: %s', messageOf(error))
-        })
-        break
-      case 'turn/end': {
-        void this.channel.sendTyping(roomId, false).catch(() => {})
-        const reason = data.reason ?? {}
-        const msg = formatTurnEnd(reason)
-        if (msg !== undefined) {
-          this.ctx.logger.warn('[dsh-matrix] turn/end not completed: %s', reason.kind)
-          void this.safeSend(roomId, msg, undefined)
-        }
-        for (const key of this.toolNames.keys()) {
-          if (key.startsWith(`${roomId}:`)) this.toolNames.delete(key)
-        }
-        this.retryCounts.delete(roomId)
-        // 串行消费：前序任务结束后，执行下一条已批准任务（若有）。
-        void this.consumeNextTask(roomId)
-        break
-      }
-      case 'tool/call': {
-        // 记录 callId↔name 配对，供 tool/result 投影时显示工具名。
-        const callId = (data.message?.source?.callId as string) ?? ''
-        const name = (data.message?.content?.find?.((b: any) => b.type === 'tool-call')?.name as string) ?? ''
-        if (callId !== '') this.toolNames.set(`${roomId}:${callId}`, name)
-        break
-      }
-      case 'tool/result': {
-        if (verbosity !== 'process') {
-          // 结果党：仅错误时可见（否则折叠，避免噪声）。
-          const isError = data.message?.content?.[0]?.isError === true
-          if (!isError) break
-        }
-        const callId = (data.message?.source?.callId as string) ?? ''
-        const name = callId !== '' ? (this.toolNames.get(`${roomId}:${callId}`) ?? '') : ''
-        const result = formatToolResult(
-          {
-            callId,
-            isError: data.message?.content?.[0]?.isError === true,
-            content: data.message?.content?.[0]?.content ?? [],
-          },
-          name,
-        )
-        void this.safeSend(roomId, result, undefined)
-        break
-      }
-      case 'llm/retry': {
-        const retry = data.retry ?? 1
-        const isUnbounded = data.maxRetries === undefined
-        const failureMsg = data.failure?.message
-        // 诊断：始终记录 retry 来源（mode/次数/原因），便于事后复盘 token 消耗。
-        this.ctx.logger.info(
-          '[dsh-matrix] llm/retry room=%s retry=%d mode=%s%s',
-          roomId,
-          retry,
-          isUnbounded ? 'always(无上限)' : `normal(上限${data.maxRetries})`,
-          failureMsg ? ` reason=${failureMsg}` : '',
-        )
-        // 过程模式：展示完整重试提示（含 always 无上限警示）。
-        if (verbosity === 'process') {
-          void this.safeSend(
-            roomId,
-            formatRetry({ retry, maxRetries: data.maxRetries, delayMs: data.delayMs ?? 0, failure: data.failure }),
-            undefined,
-          )
-        }
-        // 熔断：累计重试次数达阈值即主动终止 turn 止损（harness always 模式会无限烧 token）。
-        const threshold = this.config.maxRetriesBeforeAbort
-        if (this.config.retryCircuitBreakerEnabled && threshold > 0 && retry >= threshold) {
-          const handle = this.roomAgents.get(roomId)
-          if (handle !== undefined && handle.agent.status === 'running') {
-            this.ctx.logger.warn('[dsh-matrix] retry circuit breaker tripped room=%s retry=%d>=%d', roomId, retry, threshold)
-            handle.agent.cancel({ kind: 'hook', reason: `dsh-matrix: retry circuit breaker at ${retry}/${threshold}` })
-            void this.safeSend(roomId, formatRetryCircuitTripped(retry, threshold), undefined)
-          }
-          // cancel 后 turn/end 会触发并清理 retryCounts；此处不再累加避免重复触发。
-          break
-        }
-        this.retryCounts.set(roomId, retry)
-        break
-      }
-      case 'assistant/message': {
-        const text = assistantVisibleText(event as Extract<SessionEvent, { type: 'assistant/message' }>, verbosity)
-        if (text !== undefined) void this.deliverText(roomId, text)
-        break
-      }
-      default:
-        // 按设计忽略（与 GUI 可视化语义对齐，不 1:1 复刻 token 级细节）：
-        // - step/start / step/end：编排内部步骤标记，已由 assistant/message 吸收
-        // - assistant/chunk：流式增量，由 assistant/message 聚合后统一投
-        // - user/message：入站事件，由 handleMessage 处理，不在出站重投
-        // - tool/call：配对记录已在上方处理，无需单独投文本
-        // - request/header / compaction/* / attachment/* / run/* / agent/*：
-        //   内部/低层协议事件，对终端用户无独立意义
-        break
-    }
-  }
+     const roomId = this.roomForSession(session.id)
+     if (roomId === undefined) return
+     const verbosity = this.roomVerbosity.get(roomId) ?? 'result'
+     const data = event.data as any
+     // 用 string 比较放宽收窄，兼容宿主未导出的 'llm/retry' 等事件类型。
+     switch (event.type as string) {
+       case 'turn/start':
+         void this.channel.sendTyping(roomId, true).catch((error: unknown) => {
+           this.ctx.logger.warn('[dsh-matrix] typing failed: %s', messageOf(error))
+         })
+         break
+       case 'turn/end': {
+         void this.channel.sendTyping(roomId, false).catch(() => {})
+         const reason = data.reason ?? {}
+         const msg = formatTurnEnd(reason)
+         if (msg !== undefined) {
+           this.ctx.logger.warn('[dsh-matrix] turn/end not completed: %s', reason.kind)
+           void this.safeSend(roomId, msg, undefined)
+         }
+         for (const key of this.toolNames.keys()) {
+           if (key.startsWith(`${roomId}:`)) this.toolNames.delete(key)
+         }
+         this.retryCounts.delete(roomId)
+         // 串行消费：前序任务结束后，执行下一条已批准任务（若有）。
+         void this.consumeNextTask(roomId)
+         break
+       }
+       case 'tool/call': {
+         // tool/call 事件数据形状：{ turn, step, callId, name, arguments }
+         // arguments 是原始 JSON 字符串，需 parse 后传给执行器
+         const callId = (data.callId as string) ?? ''
+         const name = (data.name as string) ?? ''
+         const turn = (data.turn as number) ?? 0
+         const step = (data.step as number) ?? 0
+         if (callId !== '') this.toolNames.set(`${roomId}:${callId}`, name)
+
+         // 工具执行由 harness 负责：harness 会调用 provider.execute(name, args) 取得结果，
+         // 自行把 tool/result 追加回会话（dsh-llm 的 createToolResultMessage）。
+         // 因此这里只做「观察」：记录工具调用 + 写 chatlog，绝不再自行 append，
+         // 否则会与 harness 的 tool/result 重复追加，导致会话校验报错（即「执行工具报错」）。
+         if (this.config.matrixTools !== false && name.startsWith('matrix_')) {
+           let args: Record<string, unknown> = {}
+           try {
+             const rawArgs = (data.arguments as string) ?? '{}'
+             args = rawArgs ? JSON.parse(rawArgs) : {}
+           } catch {
+             this.ctx.logger.warn('[dsh-matrix] tool %s: invalid arguments JSON', name)
+           }
+           this.ctx.logger.info('[dsh-matrix] tool/call %s (%s) args=%s', name, callId, JSON.stringify(args))
+           this.chatlog.append(roomId, {
+             ts: Date.now(),
+             sender: `${this.userId} (tool)`,
+             text: `🔧 调用工具 ${name} ${JSON.stringify(args)}`,
+           })
+         }
+         break
+       }
+       case 'tool/result': {
+         if (verbosity !== 'process') {
+           // 结果党：仅错误时可见（否则折叠，避免噪声）。
+           const isError = data.message?.content?.[0]?.isError === true
+           if (!isError) break
+         }
+         const callId = (data.message?.source?.callId as string) ?? ''
+         const name = callId !== '' ? (this.toolNames.get(`${roomId}:${callId}`) ?? '') : ''
+         const result = formatToolResult(
+           {
+             callId,
+             isError: data.message?.content?.[0]?.isError === true,
+             content: data.message?.content?.[0]?.content ?? [],
+           },
+           name,
+         )
+         void this.safeSend(roomId, result, undefined)
+         break
+       }
+       case 'llm/retry': {
+         const retry = data.retry ?? 1
+         const isUnbounded = data.maxRetries === undefined
+         const failureMsg = data.failure?.message
+         // 诊断：始终记录 retry 来源（mode/次数/原因），便于事后复盘 token 消耗。
+         this.ctx.logger.info(
+           '[dsh-matrix] llm/retry room=%s retry=%d mode=%s%s',
+           roomId,
+           retry,
+           isUnbounded ? 'always(无上限)' : `normal(上限${data.maxRetries})`,
+           failureMsg ? ` reason=${failureMsg}` : '',
+         )
+         // 过程模式：展示完整重试提示（含 always 无上限警示）。
+         if (verbosity === 'process') {
+           void this.safeSend(
+             roomId,
+             formatRetry({ retry, maxRetries: data.maxRetries, delayMs: data.delayMs ?? 0, failure: data.failure }),
+             undefined,
+           )
+         }
+         // 熔断：累计重试次数达阈值即主动终止 turn 止损（harness always 模式会无限烧 token）。
+         const threshold = this.config.maxRetriesBeforeAbort
+         if (this.config.retryCircuitBreakerEnabled && threshold > 0 && retry >= threshold) {
+           const handle = this.roomAgents.get(roomId)
+           if (handle !== undefined && handle.agent.status === 'running') {
+             this.ctx.logger.warn('[dsh-matrix] retry circuit breaker tripped room=%s retry=%d>=%d', roomId, retry, threshold)
+             handle.agent.cancel({ kind: 'hook', reason: `dsh-matrix: retry circuit breaker at ${retry}/${threshold}` })
+             void this.safeSend(roomId, formatRetryCircuitTripped(retry, threshold), undefined)
+           }
+           // cancel 后 turn/end 会触发并清理 retryCounts；此处不再累加避免重复触发。
+           break
+         }
+         this.retryCounts.set(roomId, retry)
+         break
+       }
+       case 'assistant/message': {
+         const text = assistantVisibleText(event as Extract<SessionEvent, { type: 'assistant/message' }>, verbosity)
+         if (text !== undefined) void this.deliverText(roomId, text)
+         break
+       }
+       default:
+         // 按设计忽略（与 GUI 可视化语义对齐，不 1:1 复刻 token 级细节）：
+         // - step/start / step/end：编排内部步骤标记，已由 assistant/message 吸收
+         // - assistant/chunk：流式增量，由 assistant/message 聚合后统一投
+         // - user/message：入站事件，由 handleMessage 处理，不在出站重投
+         // - tool/call：配对记录已在上方处理，无需单独投文本
+         // - request/header / compaction/* / attachment/* / run/* / agent/*：
+         //   内部/低层协议事件，对终端用户无独立意义
+         break
+     }
+   }
 
   private async deliverText(roomId: string, text: string): Promise<void> {
     const cleaned = sanitizeAssistantText(text)

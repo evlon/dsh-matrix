@@ -43,6 +43,8 @@ interface StateFile {
   roomCwds?: Record<string, string>
   /** 房间级 matrix 任务队列（重启不丢）。 */
   matrixTasks?: Record<string, MatrixTask[]>
+  /** 房间会话代数：每次 /clear 或检测到损坏历史时 +1，用于生成全新确定性会话 id。 */
+  roomSessionEpochs?: Record<string, number>
 }
 
 /** 去重环最多保留的事件 id 数。Matrix 事件 id 全局唯一，重启后重放窗口有限。 */
@@ -77,6 +79,7 @@ export class BridgeState {
           ...(typeof parsed.syncToken === 'string' ? { syncToken: parsed.syncToken } : {}),
           ...(typeof parsed.roomCwds === 'object' && parsed.roomCwds !== null ? { roomCwds: parsed.roomCwds as Record<string, string> } : {}),
           ...(typeof parsed.matrixTasks === 'object' && parsed.matrixTasks !== null ? { matrixTasks: parsed.matrixTasks as Record<string, MatrixTask[]> } : {}),
+          ...(typeof parsed.roomSessionEpochs === 'object' && parsed.roomSessionEpochs !== null ? { roomSessionEpochs: parsed.roomSessionEpochs as Record<string, number> } : {}),
         }
       }
     } catch (error) {
@@ -116,6 +119,22 @@ export class BridgeState {
     if (this.data.roomCwds) delete this.data.roomCwds[roomId]
     if (this.data.matrixTasks) delete this.data.matrixTasks[roomId]
     this.scheduleSave()
+  }
+
+  // ---- 房间会话代数（用于 /clear 与损坏历史重建） ----
+
+  /** 当前房间的会话代数；无记录时返回 0（兼容旧的无后缀确定性 id）。 */
+  sessionEpoch(roomId: string): number {
+    return this.data.roomSessionEpochs?.[roomId] ?? 0
+  }
+
+  /** 代数 +1：下次 createRoomAgent 会生成新的确定性会话 id（旧 session 不再 resume）。 */
+  bumpSessionEpoch(roomId: string): number {
+    if (!this.data.roomSessionEpochs) this.data.roomSessionEpochs = {}
+    const next = (this.data.roomSessionEpochs[roomId] ?? 0) + 1
+    this.data.roomSessionEpochs[roomId] = next
+    this.scheduleSave()
+    return next
   }
 
   // ---- 房间工作目录绑定 ----

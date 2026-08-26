@@ -81,6 +81,12 @@ export interface Config {
   cwdCandidates: string[]
   /** 单个房间 matrix 任务队列上限，超出后最早 pending 任务被自动拒绝。 */
   taskQueueMax: number
+  /** 是否为 agent 注册 Matrix 工具（获取群联系人、最近消息等）。
+   * true：注册 matrix_get_room_members 等 4 个工具，模型可按需调用获取信息。
+   * false：不注册工具，回退到旧行为（将群聊历史等信息组合到消息中）。
+   * 默认 true。
+   */
+  matrixTools: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -117,4 +123,5 @@ export const Config: Schema<Config> = Schema.object({
 
   cwdCandidates: Schema.array(Schema.string()).default([process.cwd()]),
   taskQueueMax: Schema.number().default(20),
+  matrixTools: Schema.boolean().default(true),
 })
