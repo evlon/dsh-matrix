@@ -13,8 +13,10 @@ export interface DigitalTwinAccount {
   /** 角色标签（leader/pm/dev/qa/custom），仅作展示与路由提示。 */
   role: string
   /**
-   * 是否响应房间里所有消息。
-   * 省略时：主账号默认 true（个人助手模式），分身账号默认 false（@提及才响应）。
+   * 是否响应房间里所有消息（即"是否只响应 @ 自己的消息"的反向开关）。
+   * true：响应群里所有消息，无需 @（个人助手模式，主账号默认）。
+   * false：只响应 @ 自己的消息，未 @ 一律静默（分身默认，避免抢答与浪费 token）。
+   * 注意：无论此值如何，若消息 @提及 了其他已知账号，本账号仍会静默（不抢答别人的对话）。
    */
   respondToAll: boolean
   /** 覆盖顶层 provider/model；留空回退顶层值。 */
@@ -36,7 +38,7 @@ export interface Config {
   allowAllUsers: boolean
   /** 工作责任负责人（真实人账号，仅在 Matrix 客户端登录）：设置后本账号审批仅其可应答。 */
   owner: string
-  /** 是否响应房间里所有消息；默认 true（分身也可设为 false 仅 @提及响应）。 */
+  /** 是否响应房间里所有消息（false=只响应 @ 自己的消息）；默认 true（主账号个人助手模式）。 */
   respondToAll: boolean
   /** 默认 LLM provider 路由（分身未指定时使用）。 */
   provider: string

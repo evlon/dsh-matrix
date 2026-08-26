@@ -281,8 +281,9 @@ export class AccountBridge {
     this.userId = account.userId
     this.isMain = account.userId === config.userId
     this.owner = account.owner !== '' ? account.owner : (this.isMain ? config.owner : undefined)
-    // 响应策略：显式 respondToAll 优先；主账号兜底 true（旧行为）。
-    this.respondToAll = account.respondToAll || this.isMain
+    // 响应策略：完全由配置决定（主账号 Schema 默认 true，分身默认 false）。
+    // 不再强制主账号为 true，用户可显式设 false 让主账号也只响应 @ 自己的消息。
+    this.respondToAll = account.respondToAll
     this.agentOptions = {
       provider: account.provider !== '' ? account.provider : config.provider,
       model: account.model !== '' ? account.model : config.model,
@@ -355,9 +356,10 @@ export class AccountBridge {
    * 消息路由（多账号协作语义）：
    * 1. 若消息 @提及 了任一已知账号（主账号或分身），则只有被 @提及 的账号响应，
    *    其余账号（含主账号）一律静默，避免抢答别人/别的数字人的对话；
-   * 2. 无任何 @提及 时：私聊（≤2 人房间）始终响应；群聊里一律静默——无论 isMain 还是
-   *    respondToAll，都不响应未指名给自己的群消息（避免浪费 token、避免抢答别人的对话）。
-   *    分身在群里必须被显式 @提及 才响应。命令同样遵循该规则；审批应答不受此门控限制。
+   * 2. 无任何 @提及 时：私聊（≤2 人房间）始终响应；群聊里是否响应取决于 respondToAll——
+   *    respondToAll=true（主账号默认，个人助手模式）响应群里所有消息；
+   *    respondToAll=false（分身默认）只响应 @ 自己的消息，避免浪费 token 与抢答别人的对话。
+   *    命令同样遵循该规则；审批应答不受此门控限制。
    */
   private async shouldRespond(message: InboundMessage): Promise<boolean> {
     const lower = message.text.toLowerCase()
@@ -387,7 +389,13 @@ export class AccountBridge {
       this.diag.log('  -> dm-branch: respond=true')
       return true
     }
-    // 群聊：一律静默。分身/主账号都必须被显式 @提及 才响应，避免浪费 token 与抢答。
+    // 群聊：是否响应取决于 respondToAll。
+    // respondToAll=true（主账号默认，个人助手模式）：响应群里所有消息。
+    // respondToAll=false（分身默认）：只响应 @ 自己的消息，避免浪费 token 与抢答。
+    if (this.respondToAll) {
+      this.diag.log('  -> group-respondToAll-branch: respond=true')
+      return true
+    }
     this.diag.log('  -> group-silent-branch: respond=false')
     return false
   }

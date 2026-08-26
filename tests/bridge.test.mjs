@@ -206,3 +206,46 @@ test('bridge end-to-end: merge, assistant delivery, approval, commands, dedup, s
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('respondToAll 门控：true 响应群聊所有消息，false 只响应 @ 自己的', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-test-'))
+  let bridge
+  try {
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx()
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example',
+      accessToken: 'token',
+      userId: USER_ID,
+      allowedUserIds: [SENDER],
+      allowAllUsers: false,
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000,
+      mergeTimeoutSecs: 5,
+      approvalTimeoutSecs: 60,
+      stateDir: dir,
+      fetchFn: hs.fetch,
+      sleep: async () => {},
+      respondToAll: false, // 只响应 @ 自己的消息
+    })
+
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+
+    // 1) 群聊未 @ 的消息：respondToAll=false → 静默
+    hs.deliver([textEvent('$r1', '大家好，今天天气不错')])
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(captured.messages.length, 0, 'respondToAll=false 时未 @ 的群消息不应响应')
+
+    // 2) 群聊 @ 自己的消息：响应
+    hs.deliver([textEvent('$r2', '@bot 你好!!')])
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(captured.messages.length, 1, '@ 自己的消息应被投递到 agent')
+    assert.match(captured.messages[0].content[0].text, /\n【当前消息】\n你好$/)
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
