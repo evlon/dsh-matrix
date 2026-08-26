@@ -3,3 +3,4 @@ lib/
 .dsh-matrix/
 *.tsbuildinfo
 *.log
+cordis.patch.yml
