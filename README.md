@@ -5,12 +5,13 @@ DeepSeek Harness（dsh）的 Matrix 通信插件：把 Matrix 房间桥接到 ha
 ```
 src/
 ├── index.ts      # 插件入口（name/inject/apply/Config），无 default export
-├── bridge.ts     # 桥接层：多账号编排（AccountBridge）、入站路由（@提及/私聊）、审批、授权
-├── matrix.ts     # 通道层：零依赖 Matrix client-server API 客户端（fetch + /sync 长轮询）
-├── config.ts     # Schemastery 配置 schema（含数字分身 digitalTwins）
+├── bridge.ts     # 桥接层：多账号编排（AccountBridge）、入站路由（@提及/私聊）、审批、授权、媒体注入
+├── matrix.ts     # 通道层：零依赖 Matrix client-server API 客户端（fetch + /sync 长轮询、媒体下载）
+├── tools.ts      # 9 个 Matrix 工具（成员/消息/房间/用户查询、主动发送、媒体下载），经 ctx.tools.register 注册
+├── config.ts     # Schemastery 配置 schema（含数字分身 digitalTwins、媒体/工具开关）
 ├── store.ts      # 文件落盘状态：房间↔会话映射、事件去重环、sync token
 ├── auth-store.ts # 记忆授权库：分身↔Owner、工具授权、红线判定
-└── format.ts     # 保守 markdown 子集 → Matrix HTML，收敛前缀长回复分段
+└── format.ts     # 保守 markdown 子集 → Matrix HTML，收敛前缀长回复分段，媒体占位描述
 ```
 
 ## 架构
@@ -91,6 +92,10 @@ src/
 ## 能力
 
 - **Matrix → DSH**：白名单用户文本经合并窗口（`..` 继续 / `!!` 立即提交 / 裸文本进合并窗口）后，通过 `agent.followup` 注入对应房间的 agent 会话；`/bind <session-id>` 可切换到已有会话
+- **媒体处理（图片/文件/音视频/位置）**：入站非文本消息自动下载（`mxc://` → `/media/v3/download`），保存到房间工作区 `.dsh-matrix/media`（或 `stateDir/media`）并附上本地路径；**图片额外持久化为多模态 `image` 内容块**，让模型直接看见——即使模型不支持视觉，harness 也会优雅降级为文本占位而非报错（避免旧版 `read_image` 工具不存在导致的 `unknown tool` 失败）；位置消息带坐标
+- **9 个 Matrix 工具**（经 `ctx.tools.register` 注册，模型可见且可直接执行）：`matrix_get_room_members` / `matrix_get_recent_messages` / `matrix_get_room_info` / `matrix_get_user_info` / `matrix_send_room_message` / `matrix_send_dm` / `matrix_mention_member` / `matrix_list_rooms` / `matrix_get_media`（详情见下方「Matrix 工具」）
+- **主动消息**：agent 可主动私聊、向房间发消息、@成员（`matrix_send_dm`/`send_room_message`/`mention_member`）；首用经 Owner 审批记忆授权（`proactiveSendRequiresApproval`），或配置关闭直接允许
+- **房间事件**：入群/离群/邀请/改名换头像/房间名/主题变化经 `onRoomEvent` 投影，`notifyRoomEvents` 开启后注入 agent 会话（供主动打招呼等）
 - **DSH → Matrix**：监听 `session/event`，把 `assistant/message` 的可见文本分段（前缀 `（i/n）` 参与长度收敛）后以 `org.matrix.custom.html` 发回；`turn/start` 显示 typing
 - **数字分身架构**：**每个分身一个 harness 进程**——`userId` 即分身账号（bot 自己登录），`owner` 是真实人账号（仅在 Matrix 客户端登录）。分身与真人同事、其他分身在同一房间协作；@提及路由、私聊判定、多账号协调（可选 `digitalTwins` 同进程跑多分身）均已支持
 - **三级授权**：
@@ -98,7 +103,25 @@ src/
   - **L2 即时确认**：房间推送审批，配置了 `owner` 的账号**仅 Owner** 可应答，批准后写入记忆授权库
   - **L3 红线强制**：命中 `redlineTools`（默认 `bash`/`pwsh`/`write`/`edit`）→ **每次都必须确认**，批准永不入库
 - **命令**：`/help` `/status` `/new` `/clear` `/bind <session-id>` `/auth list` `/auth revoke <tool>` `/auth revoke-all`
-- **可靠性**：事件 id 持久去重环、sync token 落盘重启续传、长回复 HTML 失败回退纯文本、sync 循环指数退避
+- **可靠性**：事件 id 持久去重环、sync token 落盘重启续传、长回复 HTML 失败回退纯文本、sync 循环指数退避、LLM 受限重试熔断（`maxRetriesBeforeAbort`）
+
+### Matrix 工具
+
+`matrixTools: true`（默认）时经 `ctx.tools.register` 注册以下 9 个工具，agent 既能看见 schema 也能直接调用执行体：
+
+| 工具 | 说明 |
+|---|---|
+| `matrix_get_room_members` | 取房间成员名单（含显示名/头像 URL） |
+| `matrix_get_recent_messages` | 取房间最近 N 条消息（正序，按需回溯上下文） |
+| `matrix_get_room_info` | 取房间基本信息（房间名、人数、是否私聊等） |
+| `matrix_get_user_info` | 取指定用户的显示名与头像 |
+| `matrix_send_room_message` | 主动向房间发文本/HTML 消息 |
+| `matrix_send_dm` | 主动给指定用户私聊（自动复用既有 1:1 房或 create-room+invite） |
+| `matrix_mention_member` | 发消息并 @ 一个或多个成员（HTML `m.mention` 锚点 + `@名字` 文本兜底，校验目标都是房间成员） |
+| `matrix_list_rooms` | 列出已加入房间及名称/成员数 |
+| `matrix_get_media` | 下载 Matrix 媒体（`mxc://`）为本地文件并返回路径，或返回 base64 |
+
+主动发送类工具（`matrix_send_dm`/`send_room_message`/`mention_member`）`isConcurrencySafe=false`（防并行重复发送），首用经 `proactiveSendRequiresApproval` 控制。
 
 ## 为什么通道层不用现成 SDK
 
@@ -139,14 +162,22 @@ allowBuilds:
 | `allowAllUsers` | `false` | 允许任意用户（仅开发用） |
 | `provider` | `deepseek-official` | 每个房间 agent 的 LLM provider |
 | `model` | `deepseek-v4-flash` | 每个房间 agent 的模型 |
+| `agentPreset` | `standard` | room agent 挂载的 agent preset（决定工具集与角色提示）；留空则无工具 |
 | `chunkMaxChars` | `4000` | 出站单条消息字符上限（含分段前缀） |
 | `mergeTimeoutSecs` | `5` | 裸文本合并窗口（秒） |
 | `approvalTimeoutSecs` | `300` | 审批推送后等待聊天答复的秒数 |
 | `stateDir` | `.dsh-matrix` | 状态目录（`state.json` 房间映射 + 去重 + sync token） |
+| `maxRetriesBeforeAbort` | `5` | 同一房间 turn 内 LLM 受限自动重试达到该次数时主动 cancel 止损 |
+| `retryCircuitBreakerEnabled` | `true` | 是否启用重试熔断兜底 |
 | `digitalTwinMode` | `false` | 可选：同一进程挂载多个分身（见下方示例） |
 | `digitalTwins` | `[]` | 额外分身账号列表（通常每个分身一个进程，无需配置此项） |
 | `authStoreFile` | `auth-store.json` | 记忆授权库文件名（相对 `stateDir`） |
 | `redlineTools` | `['bash','pwsh','write','edit']` | 红线工具：即使有记忆授权也每次强制房间确认 |
+| `cwdCandidates` | `[进程 cwd]` | 新房间工作目录引导的候选目录列表；首项作为缺省 |
+| `taskQueueMax` | `20` | 单个房间 matrix 任务队列上限，超出后最早 pending 任务自动拒绝 |
+| `matrixTools` | `true` | 是否注册 9 个 Matrix 工具（成员/消息/房间/用户查询、主动发送、媒体下载） |
+| `notifyRoomEvents` | `false` | 是否把入群/离群/资料变更等房间事件注入 agent 会话（供主动打招呼等） |
+| `proactiveSendRequiresApproval` | `true` | 主动消息工具（`matrix_send_dm`/`send_room_message`/`mention_member`）首用是否需 Owner 批准 |
 
 ### 配置示例
 
@@ -205,6 +236,6 @@ corepack pnpm build       # tsc，产物 lib/（提交入库，git 安装不跑�
 ## 已知限制与路线图
 
 - **仅非加密房间**：`m.room.encrypted` 事件只提示不支持（E2EE 二期：Rust crypto + 设备验证）
-- **仅文本消息**：图片/文件/贴纸忽略；仅处理主时间线，不处理 threads
+- **媒体已支持，但无 OCR/转写**：图片/文件/音视频会下载落盘并作为多模态附件/路径交给 agent；暂不内置 OCR、音频转写、视频抽帧等解析（可用 agent 自身能力或外部工具处理已保存的文件）
 - **不流式推送工具进度**：每条 `assistant/message` 一条（或多条分段）消息
 - **仅长轮询**：无 appservice/webhook 模式，主机需可出站访问 homeserver

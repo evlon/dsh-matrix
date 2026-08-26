@@ -106,6 +106,9 @@ export interface MediaLike {
   body: string
   mimetype?: string
   filename?: string
+  size?: number
+  /** m.location 的地理坐标。 */
+  geoUri?: string
 }
 
 /**
@@ -257,7 +260,11 @@ export function describeMedia(media: readonly MediaLike[]): string {
   const parts = media.map((m) => {
     const label = LABELS[m.msgtype] ?? '附件'
     const name = m.filename ?? m.body ?? label
-    return `[${label}: ${name}${m.mimetype !== undefined ? ` (${m.mimetype})` : ''}]`
+    if (m.msgtype === 'm.location' && m.geoUri !== undefined) return `[${label}: ${name} (${m.geoUri})]`
+    const meta: string[] = []
+    if (m.mimetype !== undefined) meta.push(m.mimetype)
+    if (m.size !== undefined) meta.push(`${m.size}B`)
+    return `[${label}: ${name}${meta.length > 0 ? ` (${meta.join(', ')})` : ''}]`
   })
   return '\n' + parts.join(' ')
 }

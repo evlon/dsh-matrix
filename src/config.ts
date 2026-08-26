@@ -87,6 +87,16 @@ export interface Config {
    * 默认 true。
    */
   matrixTools: boolean
+  /** 是否把入群/离群/资料变更等房间事件注入 agent 会话（供 agent 主动打招呼等）。
+   * true：成员变化/资料变更时向对应房间 agent 注入「系统事件」消息（经 authorized 门控 + eventId 去重）。
+   * false：忽略这些事件，仅更新缓存（默认，避免大群 join/leave 刷屏与 token 浪费）。
+   */
+  notifyRoomEvents: boolean
+  /** 主动消息工具（matrix_send_dm/send_room_message/mention_member）首用是否需 Owner 批准。
+   * true：首用经 approval/request 批准后记忆授权；false：直接允许发送（谨慎）。
+   * 默认 true（安全优先）。
+   */
+  proactiveSendRequiresApproval: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -124,4 +134,6 @@ export const Config: Schema<Config> = Schema.object({
   cwdCandidates: Schema.array(Schema.string()).default([process.cwd()]),
   taskQueueMax: Schema.number().default(20),
   matrixTools: Schema.boolean().default(true),
+  notifyRoomEvents: Schema.boolean().default(false),
+  proactiveSendRequiresApproval: Schema.boolean().default(true),
 })

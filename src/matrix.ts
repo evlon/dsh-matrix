@@ -28,6 +28,13 @@ export interface MediaBlock {
   readonly filename?: string
   readonly size?: number
   readonly body: string
+  /** 图片宽高（m.image 的 info.w/h）。 */
+  readonly width?: number
+  readonly height?: number
+  /** 已下载到本地的绝对路径（桥接层下载后回填；未下载时为 undefined）。 */
+  readonly localPath?: string
+  /** m.location 的 geo_uri（地理坐标）。 */
+  readonly geoUri?: string
 }
 
 export interface InboundMessage {
@@ -40,12 +47,33 @@ export interface InboundMessage {
   readonly eventId: string
 }
 
+/** 群/房间成员变化与资料变更事件（入群/离群/邀请/改名换头像/房间信息）。
+ * 由通道层在 /sync 的 state 或 timeline 中识别并投影，经 ChannelOptions.onRoomEvent 抛出。
+ * 与消息事件（InboundMessage）分离：成员/资料事件不经过消息去重环（用独立 eventId 去重），
+ * 且由桥接层按 notifyRoomEvents 配置决定是否注入 agent。
+ */
+export type RoomEventKind = 'join' | 'leave' | 'invite' | 'profile' | 'room-name' | 'room-topic'
+
+export interface RoomEvent {
+  readonly kind: RoomEventKind
+  readonly roomId: string
+  /** 发生变化的成员 userId；房间信息事件（room-name/room-topic）为 undefined。 */
+  readonly userId?: string
+  readonly eventId: string
+  /** 事件时间戳（origin_server_ts，ms）。 */
+  readonly at: number
+  /** 各 kind 的附加信息。 */
+  readonly detail?: Record<string, unknown>
+}
+
 export interface ChannelOptions {
   readonly homeserverUrl: string
   readonly accessToken: string
   readonly userId: string
   readonly state: BridgeState
   readonly onMessage?: (message: InboundMessage) => void
+  /** 成员变化 / 资料变更 / 房间信息事件。桥接层按配置决定是否注入 agent。 */
+  readonly onRoomEvent?: (event: RoomEvent) => void
   readonly isAllowed?: (sender: string) => boolean
   readonly logger?: {
     warn: (format: string, ...args: unknown[]) => void
@@ -84,6 +112,10 @@ export interface Channel {
   stop(): Promise<void>
   sendText(roomId: string, plain: string, html?: string): Promise<void>
   sendTyping(roomId: string, active: boolean): Promise<void>
+  /** 主动给指定用户发私聊：查既有 1:1 房，无则 create-room+invite，再发送。 */
+  sendDm?(userId: string, plain: string, html?: string): Promise<{ roomId: string; eventId?: string }>
+  /** 向房间发送消息并 @ 一个或多个成员（HTML m.mention + 文本 @名字 兜底）。 */
+  sendMentionText?(roomId: string, plain: string, mentions: string[], html?: string): Promise<void>
   /** 判断是否为私聊房间（2 人房间）。 */
   isDirectRoom?(roomId: string): Promise<boolean>
   /** 读取房间名（m.room.name state）。 */
@@ -96,13 +128,23 @@ export interface Channel {
   getUserInfo?(userId: string): Promise<MatrixUserInfo | undefined>
   /** 房间最近消息（/messages API，正序）。供 agent 工具按需调用。 */
   getRecentMessages?(roomId: string, limit?: number): Promise<MatrixRoomMessage[]>
+  /** 列出本账号已加入的房间（/joined_rooms），附名称/成员数。供 agent 工具按需调用。 */
+  listJoinedRooms?(): Promise<Array<{ roomId: string; name?: string; memberCount?: number }>>
+  /** 把 mxc:// URL 解析为可下载的 HTTP URL。 */
+  resolveMediaUrl?(mxc: string): string | undefined
+  /** 下载 Matrix 媒体（mxc:// URL）为字节。供 agent 工具/桥接层按需调用。 */
+  downloadMedia?(mxc: string, signal?: AbortSignal): Promise<{ buffer: Uint8Array; mimetype?: string; size: number }>
 }
 
 /** /sync 响应中我们关心的最小结构。 */
 interface SyncResponse {
   next_batch?: string
   rooms?: {
-    join?: Record<string, { timeline?: { events?: MatrixEventJson[] } }>
+    join?: Record<string, {
+      timeline?: { events?: MatrixEventJson[] }
+      /** 房间当前状态快照（m.room.name/m.room.topic/m.room.member 等），首次同步或状态变更时投递。 */
+      state?: { events?: MatrixEventJson[] }
+    }>
     invite?: Record<string, unknown>
   }
 }
@@ -112,15 +154,27 @@ interface MatrixEventJson {
   type?: string
   sender?: string
   event_id?: string
+  origin_server_ts?: number
+  state_key?: string
   content?: {
     msgtype?: string
     body?: string
     url?: string
     mimetype?: string
+    /** m.file 的原始文件名。 */
+    filename?: string
     /** m.image/m.file/m.audio/m.video 等携带的元信息。 */
-    info?: { mimetype?: string; size?: number }
+    info?: { mimetype?: string; size?: number; w?: number; h?: number; filename?: string }
     /** m.location 的地理坐标。 */
     geo_uri?: string
+    /** m.room.member 的成员状态（join/invite/leave/ban）。 */
+    membership?: string
+    /** m.room.member 携带的显示名/头像（资料变更）。 */
+    displayname?: string
+    avatar_url?: string
+    /** m.room.name / m.room.topic 的正文。 */
+    name?: string
+    topic?: string
   }
 }
 
@@ -144,6 +198,7 @@ export class MatrixChannel implements Channel {
   private readonly countCache = new Map<string, { count: number | undefined; at: number }>()
   private readonly membersCache = new Map<string, { value: MatrixMember[]; at: number }>()
   private readonly userInfoCache = new Map<string, { value: MatrixUserInfo; at: number }>()
+  private readonly seenRoomEvents = new Set<string>()
   private stopped = false
   private loop: Promise<void> | undefined
   private lifecycleAbort: AbortController | undefined
@@ -216,10 +271,122 @@ export class MatrixChannel implements Channel {
     }
     if (rooms.join === undefined) return
     for (const [roomId, room] of Object.entries(rooms.join)) {
+      // 状态块：房间名/主题/成员变更。首次同步或状态变化时由 homeserver 投递 state 快照。
+      const stateEvents = room.state?.events
+      if (stateEvents !== undefined) {
+        for (const event of stateEvents) this.onStateEvent(roomId, event)
+      }
       const events = room.timeline?.events
       if (events === undefined) continue
       for (const event of events) this.onTimelineEvent(roomId, event)
     }
+  }
+
+  /** 处理房间状态事件（入群/离群/改名换头像/房间信息），投影为 RoomEvent 抛出。 */
+  private onStateEvent(roomId: string, event: MatrixEventJson): void {
+    if (this.stopped) return
+    const eventId = event.event_id
+    if (eventId === undefined) return
+    // 成员/资料事件用独立 eventId 去重（不走消息 markSeen 环，防 sync 状态快照重放重复触发）。
+    if (this.seenRoomEvents.has(eventId)) return
+    this.seenRoomEvents.add(eventId)
+    if (this.seenRoomEvents.size > 5000) {
+      // 防内存无限增长：清掉最旧的一半。
+      const iter = this.seenRoomEvents.values()
+      for (let i = 0; i < 2500 && iter.next().done !== true; i++) iter.next()
+      const toDelete = Array.from(this.seenRoomEvents).slice(0, 2500)
+      for (const id of toDelete) this.seenRoomEvents.delete(id)
+    }
+
+    const sender = event.sender
+    const at = event.origin_server_ts ?? Date.now()
+    if (event.type === 'm.room.member') {
+      const userId = event.state_key ?? event.sender
+      if (userId === undefined) return
+      const content = event.content
+      const membership = content?.membership
+      // 自己发起的动作（自己入群/自己改名）不投影，避免自触发。
+      if (userId === this.options.userId) {
+        this.invalidateMemberCaches(roomId)
+        return
+      }
+      // 入群/离群/邀请：成员名单变化，失效成员/人数缓存。
+      if (membership === 'invite' || membership === 'leave') {
+        this.invalidateMemberCaches(roomId)
+        const kind: RoomEventKind = membership === 'invite' ? 'invite' : 'leave'
+        this.options.onRoomEvent?.({ kind, roomId, userId, eventId, at })
+        return
+      }
+      // join 事件：若该成员已在房间成员缓存里（是资料更新而非新入群），则投 profile；
+      // 否则投 join。join 与改名都带 displayname，用「是否已在名单」区分。
+      if (membership === 'join') {
+        this.invalidateMemberCaches(roomId)
+        const alreadyMember = this.isKnownMember(roomId, userId)
+        const hasProfile = content?.displayname !== undefined || content?.avatar_url !== undefined
+        if (alreadyMember && hasProfile) {
+          this.userInfoCache.delete(userId)
+          this.options.onRoomEvent?.({
+            kind: 'profile',
+            roomId,
+            userId,
+            eventId,
+            at,
+            detail: {
+              ...(content?.displayname !== undefined ? { displayName: content.displayname } : {}),
+              ...(content?.avatar_url !== undefined ? { avatarUrl: content.avatar_url } : {}),
+            },
+          })
+          return
+        }
+        this.options.onRoomEvent?.({ kind: 'join', roomId, userId, eventId, at })
+        return
+      }
+      // 资料变更：非 join/invite/leave 的 member 事件（如 displayname/avatar 更新），
+      // 尽力而为，失效资料缓存。
+      if (content?.displayname !== undefined || content?.avatar_url !== undefined) {
+        this.userInfoCache.delete(userId)
+        this.options.onRoomEvent?.({
+          kind: 'profile',
+          roomId,
+          userId,
+          eventId,
+          at,
+          detail: {
+            ...(content?.displayname !== undefined ? { displayName: content.displayname } : {}),
+            ...(content?.avatar_url !== undefined ? { avatarUrl: content.avatar_url } : {}),
+          },
+        })
+      }
+      return
+    }
+    if (event.type === 'm.room.name') {
+      this.nameCache.delete(roomId)
+      this.options.onRoomEvent?.({
+        kind: 'room-name',
+        roomId,
+        eventId,
+        at,
+        detail: { name: event.content?.name },
+      })
+      return
+    }
+    if (event.type === 'm.room.topic') {
+      this.options.onRoomEvent?.({ kind: 'room-topic', roomId, eventId, at, detail: { topic: event.content?.topic } })
+    }
+  }
+
+  /** 成员名单或资料变化后主动失效缓存，避免工具读到陈旧名单。 */
+  private invalidateMemberCaches(roomId: string): void {
+    this.membersCache.delete(roomId)
+    this.countCache.delete(roomId)
+    this.dmCache.delete(roomId)
+  }
+
+  /** 判断某用户是否已在房间成员缓存中（用于区分「新入群」与「资料更新」）。 */
+  private isKnownMember(roomId: string, userId: string): boolean {
+    const cached = this.membersCache.get(roomId)
+    if (cached === undefined) return false
+    return cached.value.some((m) => m.userId === userId)
   }
 
   private onTimelineEvent(roomId: string, event: MatrixEventJson): void {
@@ -232,6 +399,11 @@ export class MatrixChannel implements Channel {
           roomId,
         )
       }
+      return
+    }
+    // 成员/房间状态事件也会出现在 timeline（如 join/leave/改名），转发到状态处理。
+    if (event.type === 'm.room.member' || event.type === 'm.room.name' || event.type === 'm.room.topic') {
+      this.onStateEvent(roomId, event)
       return
     }
     if (event.type !== 'm.room.message') return
@@ -247,18 +419,25 @@ export class MatrixChannel implements Channel {
     if (!(this.options.isAllowed?.(sender) ?? true)) return
 
     // 非文字消息（图片/文件/音视频/位置）：归一成 media，text 留空。
-    // 本轮只识别结构、生成占位文本；内容解析（OCR/多模态）为后续扩展点。
+    // 本轮只识别结构、生成占位文本；内容下载/解析（OCR/多模态）由桥接层/工具完成。
     const MEDIA_MSGTYPES = new Set(['m.image', 'm.file', 'm.audio', 'm.video', 'm.location'])
     let text = content.body
     let media: MediaBlock[] = []
     if (MEDIA_MSGTYPES.has(msgtype)) {
+      const isLocation = msgtype === 'm.location'
+      // Matrix 中 m.image/m.file 等的 content.url 即 mxc:// URI，url 与 mxc 同源。
+      const mxc = isLocation ? undefined : (content.url?.startsWith('mxc://') ? content.url : undefined)
       media = [{
         msgtype,
         body: content.body,
         mimetype: content.mimetype ?? content.info?.mimetype,
         url: content.url,
+        mxc,
         size: content.info?.size,
-        ...(msgtype === 'm.location' ? { mxc: undefined } : {}),
+        filename: content.filename ?? content.info?.filename,
+        width: content.info?.w,
+        height: content.info?.h,
+        geoUri: content.geo_uri,
       }]
       // 文字型 msgtype（m.text/m.notice）仍作为 text 透传；媒体消息 text 置空。
       if (msgtype === 'm.text' || msgtype === 'm.notice') {
@@ -479,8 +658,72 @@ export class MatrixChannel implements Channel {
     if (!response.ok) throw new Error(`join HTTP ${response.status}`)
   }
 
-  /** 发送事件；txnId 让 homeserver 幂等去重，重试安全。 */
-  private async sendEvent(roomId: string, type: string, content: Record<string, unknown>): Promise<void> {
+  /** 把 mxc:// URL 解析为可下载的 HTTP URL（经本 homeserver 媒体端点代理）。
+   * 非 mxc:// 返回 undefined。 */
+  resolveMediaUrl(mxc: string): string | undefined {
+    const m = /^mxc:\/\/([^/]+)\/([^/]+)$/.exec(mxc)
+    if (!m || m[1] === undefined || m[2] === undefined) return undefined
+    const server = m[1]
+    const mediaId = m[2]
+    return `${this.baseUrl}/_matrix/media/v3/download/${encodeURIComponent(server)}/${encodeURIComponent(mediaId)}`
+  }
+
+  /** 下载 Matrix 媒体（mxc:// URL）为字节。供 agent 工具/桥接层按需调用。 */
+  async downloadMedia(mxc: string, signal?: AbortSignal): Promise<{ buffer: Uint8Array; mimetype?: string; size: number }> {
+    const httpUrl = this.resolveMediaUrl(mxc)
+    if (httpUrl === undefined) throw new Error(`无效的 mxc URL: ${mxc}`)
+    this.diag.log(`[dsh-matrix:matrix] GET media ${mxc}`)
+    const response = await this.fetchFn(httpUrl, {
+      headers: { Authorization: `Bearer ${this.options.accessToken}` },
+      ...(signal !== undefined ? { signal } : {}),
+    })
+    if (!response.ok) {
+      this.diag.log(`[dsh-matrix:matrix]   <- media HTTP ${response.status}`)
+      throw new Error(`media download HTTP ${response.status}`)
+    }
+    const arrayBuffer = await response.arrayBuffer()
+    const buffer = new Uint8Array(arrayBuffer)
+    const mimetype = response.headers?.get?.('content-type') ?? undefined
+    this.diag.log(`[dsh-matrix:matrix]   <- ${buffer.length} bytes${mimetype !== undefined ? ` (${mimetype})` : ''}`)
+    return { buffer, mimetype, size: buffer.length }
+  }
+
+  /** 列出本账号已加入的房间（/joined_rooms），附名称/成员数。供 agent 工具按需调用。 */
+  async listJoinedRooms(): Promise<Array<{ roomId: string; name?: string; memberCount?: number }>> {
+    try {
+      const url = `${this.baseUrl}/_matrix/client/v3/joined_rooms`
+      this.diag.log('[dsh-matrix:matrix] GET .../joined_rooms')
+      const response = await this.fetchFn(url, {
+        headers: { Authorization: `Bearer ${this.options.accessToken}` },
+      })
+      if (!response.ok) {
+        this.diag.log(`[dsh-matrix:matrix]   <- HTTP ${response.status}`)
+        return []
+      }
+      const data = (await response.json()) as { joined_rooms?: string[] }
+      const rooms = data.joined_rooms ?? []
+      // 并发取名称/成员数（带缓存），逐项失败不致命。
+      const result = await Promise.all(rooms.map(async (roomId) => {
+        const [name, memberCount] = await Promise.all([
+          this.getRoomName(roomId),
+          this.getRoomMemberCount(roomId),
+        ])
+        return {
+          roomId,
+          ...(name !== undefined ? { name } : {}),
+          ...(memberCount !== undefined ? { memberCount } : {}),
+        }
+      }))
+      this.diag.log(`[dsh-matrix:matrix]   <- ${result.length} rooms`)
+      return result
+    } catch (err) {
+      this.diag.log(`[dsh-matrix:matrix]   !! listJoinedRooms err=${err instanceof Error ? err.message : String(err)}`)
+      return []
+    }
+  }
+
+  /** 发送事件；txnId 让 homeserver 幂等去重，重试安全。公开供工具/桥接复用。 */
+  async sendEvent(roomId: string, type: string, content: Record<string, unknown>): Promise<void> {
     const txnId = `${Date.now()}-${randomUUID()}`
     const url = `${this.baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/${type}/${txnId}`
     const response = await this.fetchFn(url, {
@@ -493,8 +736,114 @@ export class MatrixChannel implements Channel {
     })
     if (!response.ok) throw new Error(`send HTTP ${response.status}`)
   }
+
+  /**
+   * 主动给指定用户发私聊。
+   * 1) 从已加入房间中找与该用户共有的 1:1 房（≤2 人且含该用户）；
+   * 2) 找不到则 create-room（preset private_chat）+ invite；
+   * 3) 在目标房间 sendText。
+   * 返回目标 roomId（create 后可能因并发延迟，invite 已发出即可发送）。
+   */
+  async sendDm(userId: string, plain: string, html?: string): Promise<{ roomId: string; eventId?: string }> {
+    const existing = await this.findDirectRoomWith(userId)
+    if (existing !== undefined) {
+      await this.sendText(existing, plain, html)
+      return { roomId: existing }
+    }
+    const roomId = await this.createDirectRoom(userId)
+    await this.sendText(roomId, plain, html)
+    return { roomId }
+  }
+
+  /** 在已加入房间中找与目标用户共有的私聊房（≤2 人且含目标用户）。 */
+  private async findDirectRoomWith(userId: string): Promise<string | undefined> {
+    try {
+      const url = `${this.baseUrl}/_matrix/client/v3/joined_rooms`
+      const response = await this.fetchFn(url, {
+        headers: { Authorization: `Bearer ${this.options.accessToken}` },
+      })
+      if (!response.ok) throw new Error(`joined_rooms HTTP ${response.status}`)
+      const data = (await response.json()) as { joined_rooms?: string[] }
+      const rooms = data.joined_rooms ?? []
+      for (const roomId of rooms) {
+        const members = await this.getRoomMembers(roomId)
+        if (members === undefined) continue
+        // 1:1 房：恰好含目标用户，且总人数 ≤2。
+        if (members.length <= 2 && members.some((m) => m.userId === userId)) {
+          return roomId
+        }
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** create-room（private_chat）+ invite 目标用户，返回新房间 id。 */
+  private async createDirectRoom(userId: string): Promise<string> {
+    const url = `${this.baseUrl}/_matrix/client/v3/createRoom`
+    const body = {
+      preset: 'private_chat',
+      invite: [userId],
+      is_direct: true,
+    }
+    const response = await this.fetchFn(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.options.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    })
+    if (!response.ok) throw new Error(`createRoom HTTP ${response.status}`)
+    const data = (await response.json()) as { room_id?: string }
+    const roomId = data.room_id
+    if (roomId === undefined) throw new Error('createRoom returned no room_id')
+    // 失效该房间相关的缓存（新房间）。
+    this.dmCache.delete(roomId)
+    return roomId
+  }
+
+  /** 向房间发送消息并 @ 一个或多个成员：HTML 用 m.mention 锚点，文本用 @名字 兜底。 */
+  async sendMentionText(roomId: string, plain: string, mentions: string[], html?: string): Promise<void> {
+    // HTML：用 @user:server 的 displayname 链接。目标用户 displayname 尽力获取。
+    const links = await Promise.all(mentions.map(async (userId) => {
+      let name = localpartOf(userId)
+      try {
+        const info = await this.getUserInfo(userId)
+        if (info?.displayName !== undefined && info.displayName !== '') name = info.displayName
+      } catch {
+        // 保持 localpart 兜底
+      }
+      return { userId, name }
+    }))
+    const htmlBody = links.map((l) => `<a href="https://matrix.to/#/${encodeURIComponent(l.userId)}">${escapeHtml(l.name)}</a>`).join(' ')
+    const fallback = links.map((l) => `@${l.name}`).join(' ')
+    const content: Record<string, unknown> = {
+      msgtype: 'm.text',
+      body: html !== undefined ? `${html}\n\n${fallback}` : `${plain}\n\n${fallback}`,
+      format: 'org.matrix.custom.html',
+      formatted_body: html !== undefined ? `${html}<br/>${htmlBody}` : `${escapeHtml(plain)}<br/>${htmlBody}`,
+    }
+    await this.sendEvent(roomId, 'm.room.message', content)
+  }
 }
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** 从完整 Matrix user id（@user:server）中取本地部分（user）。 */
+function localpartOf(userId: string): string {
+  const at = userId.indexOf(':')
+  return userId.startsWith('@') && at > 0 ? userId.slice(1, at) : userId
+}
+
+/** HTML 转义（用于 mention 锚点与正文）。 */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
 }

@@ -10,18 +10,21 @@
 
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { TextBlock } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, TextBlock } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
+import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { Config, DigitalTwinAccount } from './config.js'
 import { chunkText, markdownToHtml, formatToolCall, describeMedia, wantsProcess, formatToolResult, formatTurnEnd, formatRetry, formatRetryCircuitTripped, formatTasks, formatCwdGuide, formatRules, formatWorkspaceState } from './format.js'
 import type { Verbosity, WorkspaceState } from './format.js'
 import { MatrixChannel } from './matrix.js'
-import type { Channel, InboundMessage } from './matrix.js'
+import type { Channel, InboundMessage, MediaBlock, RoomEvent } from './matrix.js'
 import { getDiag } from './diag.js'
 import { ChatLog } from './chatlog.js'
 import { BridgeState } from './store.js'
@@ -30,6 +33,38 @@ import { AuthStore } from './auth-store.js'
 
 const APPROVE_RE = /^(批准|同意|approve|yes|ok)$/i
 const DENY_RE = /^(拒绝|驳回|deny|no|reject)$/i
+
+/** 媒体 msgtype → 中文标签（入站媒体归一）。 */
+const MEDIA_LABELS: Record<string, string> = {
+  'm.image': '图片',
+  'm.file': '文件',
+  'm.audio': '音频',
+  'm.video': '视频',
+  'm.location': '位置',
+}
+
+/** 根据 mimetype 推断文件扩展名（含点前缀；未知返回空串）。 */
+function mediaExtension(mimetype?: string): string {
+  if (mimetype === undefined) return ''
+  const table: Record<string, string> = {
+    'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif',
+    'image/svg+xml': '.svg', 'application/pdf': '.pdf', 'text/plain': '.txt',
+    'application/json': '.json', 'application/zip': '.zip', 'audio/mpeg': '.mp3',
+    'audio/ogg': '.ogg', 'video/mp4': '.mp4',
+  }
+  return table[mimetype] ?? ''
+}
+
+/** 把 mimetype 归一为 harness 多模态接受的图片类型；非支持类型返回 undefined。 */
+function normalizeImageMediaType(mimetype?: string): ImageMediaType | undefined {
+  switch (mimetype) {
+    case 'image/png': return 'image/png'
+    case 'image/jpeg': return 'image/jpeg'
+    case 'image/webp': return 'image/webp'
+    case 'image/gif': return 'image/gif'
+    default: return undefined
+  }
+}
 
 const HELP_TEXT = [
   '/help — 显示本帮助',
@@ -57,6 +92,8 @@ interface MergeBuffer {
   parts: string[]
   sender?: string
   timer?: NodeJS.Timeout
+  /** 合并窗口内累积的入站图片多模态附件，flush 时随文本一并注入。 */
+  imageRefs: ImageAttachmentRef[]
 }
 
 interface PendingApproval {
@@ -229,6 +266,10 @@ export class AccountBridge {
   /** 并发单飞锁：避免同一 roomId 的消息同时进入 getRoomAgent 时重复创建会话。 */
   private readonly roomAgentInflight = new Map<string, Promise<Agent>>()
   private readonly mergeBuffers = new Map<string, MergeBuffer>()
+  /** 已注入的房间事件 eventId 去重（防 sync 重放重复触发）。 */
+  private readonly seenRoomEventIds = new Set<string>()
+  /** 房间事件合并窗口（多人同批 join/leave 合并成一条注入）。 */
+  private readonly roomEventBuffers = new Map<string, { events: RoomEvent[]; timer?: NodeJS.Timeout }>()
   private readonly pendingApprovals = new Map<string, PendingApproval[]>()
   /**
    * 工具名配对缓存：tool/result 事件只带 callId 不带 name，需经 tool/call 的
@@ -299,6 +340,9 @@ export class AccountBridge {
       onMessage: (message) => {
         void this.handleMessage(message)
       },
+      onRoomEvent: (event) => {
+        void this.handleRoomEvent(event)
+      },
       isAllowed: (sender) => this.authorized(sender),
       logger: ctx.logger,
       ...(fetchFn === undefined ? {} : { fetchFn }),
@@ -344,6 +388,9 @@ export class AccountBridge {
       applyMatrixTools(this.ctx, {
         channel: this.channel as MatrixChannel,
         roomForSession: (sessionId: string) => this.roomForSession(sessionId),
+        approveProactiveSend: (toolName: string, args: Record<string, unknown>, exec: ToolRunContext) =>
+          this.approveProactiveSend(toolName, args, exec),
+        mediaDirForSession: (sessionId: string) => this.mediaDirForSession(sessionId),
       })
       this.ctx.logger.info('[dsh-matrix] matrix tools registered into ToolRuntime')
     }).catch((error: unknown) => {
@@ -444,6 +491,24 @@ export class AccountBridge {
 
   roomForSession(sessionId: string): string | undefined {
     return this.state.sessionRoom(sessionId)
+  }
+
+  /**
+   * 返回某会话（agent）对应的媒体保存目录。
+   * 优先该房间绑定的工作目录下 .dsh-matrix/media；无 cwd 时回退 stateDir/media。
+   * matrix_get_media 工具据此落盘下载的媒体。
+   */
+  private mediaDirForSession(sessionId: string): string | undefined {
+    try {
+      const roomId = this.state.sessionRoom(sessionId)
+      if (roomId !== undefined) {
+        const cwd = this.state.roomCwd(roomId)
+        if (cwd !== undefined) return join(cwd, '.dsh-matrix', 'media')
+      }
+      return join(this.config.stateDir, 'media')
+    } catch {
+      return join(this.config.stateDir, 'media')
+    }
   }
 
   private getRoomAgent(roomId: string): Promise<Agent> {
@@ -683,12 +748,159 @@ export class AccountBridge {
 
   /** ---------- 入站消息 ---------- */
 
+  /**
+   * 处理房间成员/资料变更事件（入群/离群/改名换头像/邀请）。
+   * 门控：
+   *   - config.notifyRoomEvents 为 false 时直接忽略（事件已由通道层更新缓存）。
+   *   - 事件涉及的用户不在授权名单时不注入（不自动建会话，避免白名单外触发）。
+   *   - 注入前把连续事件合并（如多人同批 join）成一条，避免每次事件建一个 turn。
+   * 注入方式：向该房间已绑定的 agent followup 一条「系统事件」user 消息，
+   *   让 agent 能基于事件主动打招呼/回应（配合 prompt/skill 引导）。
+   */
+  private async handleRoomEvent(event: RoomEvent): Promise<void> {
+    if (!this.config.notifyRoomEvents) return
+    // 事件涉及的成员需在授权名单（join/leave/profile/invite 有 userId）。
+    if (event.userId !== undefined && !this.authorized(event.userId)) {
+      this.diag.log(`handleRoomEvent room=${event.roomId} kind=${event.kind} user=${event.userId} unauthorized; ignored`)
+      return
+    }
+    // 房间信息事件（room-name/room-topic）没有 userId，用房间名判断是否已知房间。
+    if (event.userId === undefined && !this.roomAgents.has(event.roomId)) {
+      this.diag.log(`handleRoomEvent room=${event.roomId} kind=${event.kind} no bound agent; ignored`)
+      return
+    }
+    // 事件注入去重（用 eventId）：已见过则不重复注入。
+    if (this.seenRoomEventIds.has(event.eventId)) return
+    this.seenRoomEventIds.add(event.eventId)
+
+    // 合并窗口：同一房间 3 秒内的成员事件合并成一条，避免 join/leave 刷屏建多 turn。
+    const key = event.roomId
+    const buf = this.roomEventBuffers.get(key) ?? { events: [], timer: undefined }
+    buf.events.push(event)
+    if (buf.timer !== undefined) clearTimeout(buf.timer)
+    buf.timer = setTimeout(() => {
+      void this.flushRoomEvents(key)
+    }, this.config.mergeTimeoutSecs * 1000)
+    this.roomEventBuffers.set(key, buf)
+  }
+
+  /** 把合并窗口内的房间事件组合成一条消息注入 agent。 */
+  private flushRoomEvents(roomId: string): void {
+    const buf = this.roomEventBuffers.get(roomId)
+    if (buf === undefined) return
+    this.roomEventBuffers.delete(roomId)
+    if (buf.timer !== undefined) clearTimeout(buf.timer)
+    if (buf.events.length === 0) return
+    const lines = buf.events.map((e) => this.formatRoomEvent(e))
+    const text = `[系统事件·${lines.length > 1 ? `${lines.length} 项` : '1 项'}]\n${lines.join('\n')}`
+    this.diag.log(`flushRoomEvents room=${roomId} events=${buf.events.length} text=${text.slice(0, 80)}`)
+    void this.deliverRoomEvent(roomId, text)
+  }
+
+  /** 把一条 RoomEvent 格式化为 agent 可读的一行文本。 */
+  private formatRoomEvent(e: RoomEvent): string {
+    const who = e.userId ?? '(房间)'
+    switch (e.kind) {
+      case 'join': return `新成员 ${who} 加入了本房间`
+      case 'leave': return `成员 ${who} 离开了本房间`
+      case 'invite': return `${who} 被邀请进本房间`
+      case 'profile':
+        return `成员 ${who} 更新了资料（${Object.entries(e.detail ?? {}).map(([k, v]) => `${k}=${String(v)}`).join(', ')}）`
+      case 'room-name': return `房间名称变更为「${String(e.detail?.name ?? '')}」`
+      case 'room-topic': return `房间主题更新`
+      default: return `房间事件（${e.kind}）`
+    }
+  }
+
+  /** 把房间事件文本注入房间 agent 会话（复用 roomContextLabel 前缀 + deliver 路径）。 */
+  private async deliverRoomEvent(roomId: string, text: string): Promise<void> {
+    try {
+      // 仅注入已绑定会话的房间；未绑定不自动建会话。
+      const handle = this.roomAgents.get(roomId)
+      if (handle === undefined) {
+        this.diag.log(`deliverRoomEvent room=${roomId} no bound agent; skip`)
+        return
+      }
+      const label = await this.roomContextLabel(roomId)
+      const body = `${label}\n${text}`
+      handle.agent.followup(createUserMessage({
+        content: [{ type: 'text', text: body }],
+        source: { kind: 'user', sender: `@system:${this.userId}` },
+      }))
+    } catch (error) {
+      this.ctx.logger.warn('[dsh-matrix] deliverRoomEvent room=%s failed: %s', roomId, messageOf(error))
+    }
+  }
+
+  /**
+   * 把入站媒体归一为 agent 可读文本：尝试下载 mxc 媒体到本地并附上路径，
+   * 让 agent 能真正处理图片/文件；下载失败则退化为占位文本。
+   * 图片额外通过 ctx.attachments 持久化为多模态引用（imageRefs），供 deliver 附加为
+   * 视觉内容块，使模型直接“看见”图片而无需调用文件读取工具。
+   * 保存目录：优先该房间工作目录的 .dsh-matrix/media，无 cwd 时回退 stateDir/media。
+   * 返回的 text 为空串表示无媒体。
+   */
+  private async describeMedia(roomId: string, media: readonly MediaBlock[]): Promise<{ text: string; imageRefs: ImageAttachmentRef[] }> {
+    if (media.length === 0) return { text: '', imageRefs: [] }
+    const parts: string[] = []
+    const imageRefs: ImageAttachmentRef[] = []
+    for (const m of media) {
+      const label = MEDIA_LABELS[m.msgtype] ?? '附件'
+      const name = m.filename ?? m.body ?? label
+      if (m.mxc !== undefined && m.mxc !== '' && this.config.matrixTools) {
+        try {
+          const { buffer, mimetype } = await this.channel.downloadMedia!(m.mxc)
+          const cwd = this.state.roomCwd(roomId)
+          const dir = cwd !== undefined ? join(cwd, '.dsh-matrix', 'media') : join(this.config.stateDir, 'media')
+          await mkdir(dir, { recursive: true })
+          const ext = mediaExtension(mimetype)
+          const safe = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_') || `matrix-media-${Date.now()}${ext}`
+          const target = join(dir, safe)
+          await writeFile(target, buffer)
+          this.diag.log(`describeMedia room=${roomId} saved=${target} size=${buffer.length}`)
+          parts.push(`[${label}: ${name} — 已保存到 ${target}]`)
+          // 图片额外持久化为多模态附件，供视觉输入。
+          if (m.msgtype === 'm.image') {
+            const mediaType = normalizeImageMediaType(mimetype)
+            if (mediaType !== undefined) {
+              try {
+                const ref = await this.saveImageAttachment(buffer, mediaType, name)
+                imageRefs.push(ref)
+              } catch (error) {
+                this.diag.log(`describeMedia room=${roomId} saveImage failed: ${messageOf(error)}`)
+              }
+            }
+          }
+          continue
+        } catch (error) {
+          this.diag.log(`describeMedia room=${roomId} download failed: ${messageOf(error)}`)
+        }
+      }
+      // 位置消息无 mxc，把坐标写进文本（geo_uri 形如 geo:37.78,-122.41;u=35）。
+      if (m.msgtype === 'm.location' && m.geoUri !== undefined) {
+        parts.push(`[位置: ${name} — ${m.geoUri}]`)
+        continue
+      }
+      parts.push(`[${label}: ${name}${m.mimetype !== undefined ? ` (${m.mimetype})` : ''}]`)
+    }
+    return { text: '\n' + parts.join(' '), imageRefs }
+  }
+
+  /** 把图片字节持久化为 harness 多模态附件（ctx.attachments.saveImage）。 */
+  private async saveImageAttachment(data: Uint8Array, mediaType: ImageMediaType, name: string): Promise<ImageAttachmentRef> {
+    const attachments = this.ctx.get('attachments')
+    if (attachments === undefined) throw new Error('attachments service unavailable')
+    return await attachments.saveImage({ data, mediaType, name })
+  }
+
   private async handleMessage(message: InboundMessage): Promise<void> {
     try {
       // 入站归一化：把文本与媒体占位合并成一条 message.text。
-      // 媒体本轮仅占位（如「[图片: xxx.png]」），内容解析为后续扩展点；
-      // 不静默丢弃，避免用户发图后 agent 无响应造成的困惑。
-      const text = (message.text + describeMedia(message.media)).trim()
+      // 媒体会尝试下载到本地并附上路径（图片/文件/音视频），让 agent 能真正处理；
+      // 图片额外持久化为多模态附件（imageRefs），使模型直接看见图片。
+      // 下载失败则退化为占位文本，不静默丢弃，避免用户发图后 agent 无响应。
+      const { text: mediaText, imageRefs } = await this.describeMedia(message.roomId, message.media)
+      const text = (message.text + mediaText).trim()
       if (text === '') return
 
       // 剥离「已知账号」的 @提及 前缀后再判定命令/审批词（如 '@ai-dev /auth list'）。
@@ -798,9 +1010,11 @@ export class AccountBridge {
         rest = stripped.slice(0, -2).trim()
       }
       if (rest === '') return
-      const buffer = this.mergeBuffers.get(message.roomId) ?? { parts: [], sender: message.sender }
+      const buffer = this.mergeBuffers.get(message.roomId) ?? { parts: [], sender: message.sender, imageRefs: [] }
       if (buffer.timer !== undefined) clearTimeout(buffer.timer)
       buffer.parts.push(rest)
+      // 合并窗口内的图片附件一并携带，避免多图/图文同批时丢图。
+      if (imageRefs !== undefined && imageRefs.length > 0) buffer.imageRefs.push(...imageRefs)
       buffer.timer = setTimeout(() => {
         this.flushMerge(message.roomId)
       }, this.config.mergeTimeoutSecs * 1000)
@@ -818,7 +1032,7 @@ export class AccountBridge {
     if (buffer.timer !== undefined) clearTimeout(buffer.timer)
     const text = buffer.parts.join('\n').trim()
     if (text === '') return
-    void this.deliver(roomId, text, buffer.sender)
+    void this.deliver(roomId, text, buffer.sender, buffer.imageRefs)
   }
 
   /**
@@ -850,14 +1064,20 @@ export class AccountBridge {
     return label
   }
 
-  private async deliver(roomId: string, text: string, sender?: string): Promise<void> {
+  private async deliver(roomId: string, text: string, sender?: string, imageRefs?: ImageAttachmentRef[]): Promise<void> {
     const agent = await this.getRoomAgent(roomId)
     // 群聊上下文：群名+人数+身份一行前缀，避免 agent 误把群消息当私聊对话。
     // 仅注入房间标签（约 1 行）；完整群聊历史已改由 matrix_get_recent_messages 工具按需获取。
     const label = await this.roomContextLabel(roomId)
     const body = `${label}\n${text}`
+    const content: ContentBlock[] = [{ type: 'text', text: body }]
+    // 入站图片作为多模态内容块附加，让模型直接“看见”图片，
+    // 无需再调用文件读取工具（避免 read_image 这类未注册工具导致失败）。
+    if (imageRefs !== undefined && imageRefs.length > 0) {
+      for (const ref of imageRefs) content.push({ type: 'image', attachment: ref })
+    }
     agent.followup(createUserMessage({
-      content: [{ type: 'text', text: body }],
+      content,
       source: {
         kind: 'user',
         ...(sender !== undefined ? { sender } : {}),
@@ -1336,6 +1556,55 @@ export class AccountBridge {
   }
 
   /** ---------- 审批（三级授权） ---------- */
+
+  /**
+   * 主动消息工具执行前的授权检查（供工具 deps.approveProactiveSend 回调）。
+   * - proactiveSendRequiresApproval=false：直接放行。
+   * - 已有该工具的长期授权：放行。
+   * - 否则发起一次 approval/request（推送到房间，Owner 回复批准/拒绝）；
+   *   批准则记忆授权（grantOnApprove）并放行，拒绝则阻止发送。
+   */
+  private async approveProactiveSend(
+    toolName: string,
+    args: Record<string, unknown>,
+    exec: ToolRunContext,
+  ): Promise<boolean> {
+    if (!this.config.proactiveSendRequiresApproval) {
+      this.diag.log(`approveProactiveSend tool=${toolName} proactive approval disabled; allow`)
+      return true
+    }
+    // 解析目标房间：显式 roomId 或 exec.agent.id 反查。
+    const explicit = typeof args.roomId === 'string' && args.roomId.length > 0 ? args.roomId : undefined
+    const sessionId = exec.agent?.id
+    const roomId = explicit ?? (sessionId !== undefined ? this.roomForSession(sessionId) : undefined)
+    if (roomId === undefined) {
+      this.diag.log(`approveProactiveSend tool=${toolName} no room to push approval; deny`)
+      return false
+    }
+    if (!this.isRedline(toolName) && this.authStore.isStandingAuthorized(this.userId, roomId, toolName, this.config.redlineTools ?? [])) {
+      this.diag.log(`approveProactiveSend tool=${toolName} room=${roomId} standing auth; allow`)
+      return true
+    }
+    if (exec.agent === undefined) {
+      this.diag.log(`approveProactiveSend tool=${toolName} no agent context; deny`)
+      return false
+    }
+    const request: ApprovalRequest = {
+      agent: exec.agent,
+      toolName,
+      reason: `主动${toolName === 'matrix_send_dm' ? '私聊' : '发消息'}，需 Owner 批准`,
+      ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
+    }
+    const outcome = await this.handleApproval(roomId, request)
+    this.diag.log(`approveProactiveSend tool=${toolName} room=${roomId} outcome=${outcome}`)
+    if (outcome === 'allowed-once') {
+      // 记忆授权（grantOnApprove=true 的路径会写入；这里显式补一次以便后续自动放行）。
+      this.authStore.grant(this.userId, this.owner ?? this.userId, roomId, toolName)
+      void this.authStore.save().catch(() => {})
+      return true
+    }
+    return false
+  }
 
   handleApproval(roomId: string, request: ApprovalRequest): Promise<ApprovalOutcome> {
     const grantable = !this.isRedline(request.toolName)

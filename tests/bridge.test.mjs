@@ -9,7 +9,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -66,6 +66,13 @@ function fakeHomeserver() {
       }
       if (path.includes('/typing/')) return { ok: true, status: 200, async json() { return {} } }
       if (path.endsWith('/join')) return { ok: true, status: 200, async json() { return { room_id: ROOM_ID } } }
+      if (path.includes('/_matrix/media/v3/download/')) {
+        return {
+          ok: true, status: 200,
+          headers: new Headers({ 'content-type': 'image/png' }),
+          async arrayBuffer() { return new TextEncoder().encode('PNGDATA').buffer },
+        }
+      }
       return { ok: true, status: 200, async json() { return {} } }
     },
     deliver(events) {
@@ -83,7 +90,14 @@ function textEvent(eventId, body) {
   return { type: 'm.room.message', sender: SENDER, event_id: eventId, content: { msgtype: 'm.text', body } }
 }
 
-function makeCtx() {
+function imageEvent(eventId, mxc) {
+  return {
+    type: 'm.room.message', sender: SENDER, event_id: eventId,
+    content: { msgtype: 'm.image', body: 'photo.png', url: mxc, info: { mimetype: 'image/png', size: 7, w: 800, h: 600 } },
+  }
+}
+
+function makeCtx(extraServices = {}) {
   const captured = { messages: [], sessionHandler: undefined, approvalHandler: undefined, agents: [], appends: [], tools: [] }
   const agentById = new Map()
   const toolsService = {
@@ -116,6 +130,7 @@ function makeCtx() {
       tools: toolsService,
       logger: { warn() {}, error() {}, info() {} },
       get(service) {
+        if (service in extraServices) return extraServices[service]
         if (service === 'agentPresets') return { async mount() {} }
         if (service === 'tools') return toolsService
         return undefined
@@ -324,13 +339,21 @@ test('bridge: matrix tools registration and execution', async () => {
     assert.ok(captured.agents.length >= 1, '应创建 agent')
 
     // 验证工具已注册：start() 时主账号一次性注册到全局 ToolRuntime（ctx.tools.register），
-    // 与 agent 创建无关；4 个 matrix 工具都应出现。
-    await waitFor(() => captured.tools.length >= 4)
+    // 与 agent 创建无关；9 个 matrix 工具（4 只读 + 4 主动/列表 + 1 媒体下载）都应出现。
+    await waitFor(() => captured.tools.length >= 9)
     const schemaNames = captured.tools.map(t => t.name)
     assert.ok(schemaNames.includes('matrix_get_room_members'), '应包含 matrix_get_room_members')
     assert.ok(schemaNames.includes('matrix_get_user_info'), '应包含 matrix_get_user_info')
+    assert.ok(schemaNames.includes('matrix_send_room_message'), '应包含 matrix_send_room_message')
+    assert.ok(schemaNames.includes('matrix_send_dm'), '应包含 matrix_send_dm')
+    assert.ok(schemaNames.includes('matrix_mention_member'), '应包含 matrix_mention_member')
+    assert.ok(schemaNames.includes('matrix_list_rooms'), '应包含 matrix_list_rooms')
+    assert.ok(schemaNames.includes('matrix_get_media'), '应包含 matrix_get_media')
     const roomMembersTool = captured.tools.find(t => t.name === 'matrix_get_room_members')
     assert.ok(roomMembersTool && typeof roomMembersTool.execute === 'function', '注册的工具应带 execute 执行体')
+    // 主动消息工具应标记为并发不安全（防并行重复发送）。
+    const sendDmTool = captured.tools.find(t => t.name === 'matrix_send_dm')
+    assert.ok(sendDmTool && sendDmTool.isConcurrencySafe() === false, '主动发送工具应并发不安全')
 
     // 工具执行由 harness 负责：harness 调用 execute() 并把结果追加为 tool/result。
     // plugin 的 tool/call handler 只观察（记录 chatlog + 日志），不再自行 append。
@@ -404,8 +427,8 @@ test('bridge: tool/call handler observes only; execution via provider.execute', 
     await startPromise
 
     hs.deliver([textEvent('$t1', '@bot 你好!!')])
-    await waitFor(() => captured.tools.length >= 4)
-    assert.ok(captured.tools.length >= 4, '应注册 4 个 matrix 工具')
+    await waitFor(() => captured.tools.length >= 9)
+    assert.ok(captured.tools.length >= 9, '应注册全部 matrix 工具')
     await waitFor(() => captured.agents.length >= 1)
     assert.ok(captured.agents.length >= 1, '应创建 agent')
 
@@ -545,6 +568,295 @@ test('bridge: orphan tool-result history triggers session rebuild with new epoch
     assert.ok(rebuilt, '损坏历史应触发带新 epoch 的会话重建')
     // 房间绑定应指向新 session
     assert.equal(account['state'].roomSession('!room:hs.example'), rebuilt.agent.id)
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// 房间事件注入：notifyRoomEvents=true 且成员已授权时，join 事件应注入已绑定 agent；
+// notifyRoomEvents=false 时忽略（不注入）。
+test('bridge: room event injection gated by notifyRoomEvents', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-roomevent-test-'))
+  let bridge
+  try {
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx()
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example',
+      accessToken: 'token',
+      userId: USER_ID,
+      allowedUserIds: [SENDER],
+      allowAllUsers: false,
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000,
+      mergeTimeoutSecs: 1,
+      approvalTimeoutSecs: 60,
+      stateDir: dir,
+      fetchFn: hs.fetch,
+      sleep: async () => {},
+      respondToAll: true,
+      matrixTools: true,
+      notifyRoomEvents: true,
+    })
+
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+
+    // 先建一个已绑定 agent 的房间
+    hs.deliver([textEvent('$t1', '@bot 你好!!')])
+    await waitFor(() => captured.agents.length >= 1)
+    assert.ok(captured.agents.length >= 1, '应先创建 agent')
+    const before = captured.messages.length
+
+    // 模拟通道层收到 join 事件：成员 @alice（已授权 SENDER）加入。
+    const account = bridge['accounts'][0]
+    account['channel']['options'].onRoomEvent({
+      kind: 'join', roomId: '!room:hs.example', userId: SENDER, eventId: '$join1', at: Date.now(),
+    })
+    // 等待合并窗口 + 注入
+    await waitFor(() => captured.messages.length > before, 3000)
+    const injected = captured.messages.slice(before)
+    assert.ok(injected.length >= 1, 'join 事件应注入 agent')
+    const text = injected[0].content[0].text
+    assert.ok(text.includes('新成员') && text.includes(SENDER), '注入文本应含新成员信息')
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// 房间事件：notifyRoomEvents=false 时忽略，不注入 agent。
+test('bridge: room event ignored when notifyRoomEvents=false', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-roomevent-off-test-'))
+  let bridge
+  try {
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx()
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example',
+      accessToken: 'token',
+      userId: USER_ID,
+      allowedUserIds: [SENDER],
+      allowAllUsers: false,
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000,
+      mergeTimeoutSecs: 1,
+      approvalTimeoutSecs: 60,
+      stateDir: dir,
+      fetchFn: hs.fetch,
+      sleep: async () => {},
+      respondToAll: true,
+      matrixTools: true,
+      notifyRoomEvents: false, // 默认关闭
+    })
+
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+
+    hs.deliver([textEvent('$t1', '@bot 你好!!')])
+    await waitFor(() => captured.agents.length >= 1)
+    const before = captured.messages.length
+
+    const account = bridge['accounts'][0]
+    account['channel']['options'].onRoomEvent({
+      kind: 'join', roomId: '!room:hs.example', userId: SENDER, eventId: '$join1', at: Date.now(),
+    })
+    // 等待一个合并周期，确保没注入
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    assert.equal(captured.messages.length, before, 'notifyRoomEvents=false 时不应注入事件')
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// 主动消息授权：proactiveSendRequiresApproval=false 直接放行。
+test('bridge: proactive send allowed when approval disabled', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-proactive-allow-test-'))
+  let bridge
+  try {
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx()
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example',
+      accessToken: 'token',
+      userId: USER_ID,
+      allowedUserIds: [SENDER],
+      allowAllUsers: false,
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000,
+      mergeTimeoutSecs: 1,
+      approvalTimeoutSecs: 60,
+      stateDir: dir,
+      fetchFn: hs.fetch,
+      sleep: async () => {},
+      respondToAll: true,
+      matrixTools: true,
+      proactiveSendRequiresApproval: false,
+    })
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+
+    const account = bridge['accounts'][0]
+    const agent = { id: 'matrix-ai-bot-test', status: 'idle', session: { id: 'x', append() {}, deriveMessages() { return [] } }, followup() {} }
+    const ok = await account['approveProactiveSend']('matrix_send_dm', { userId: '@alice:hs.example' }, { agent, signal: new AbortController().signal })
+    assert.equal(ok, true, '审批关闭时应直接放行')
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// 主动消息授权：proactiveSendRequiresApproval=true 且无长期授权时发起审批，拒绝则阻止。
+test('bridge: proactive send denied without approval', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-proactive-deny-test-'))
+  let bridge
+  try {
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx()
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example',
+      accessToken: 'token',
+      userId: USER_ID,
+      allowedUserIds: [SENDER],
+      allowAllUsers: false,
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000,
+      mergeTimeoutSecs: 1,
+      approvalTimeoutSecs: 60,
+      stateDir: dir,
+      fetchFn: hs.fetch,
+      sleep: async () => {},
+      respondToAll: true,
+      matrixTools: true,
+      proactiveSendRequiresApproval: true,
+      approvalTimeoutSecs: 2,
+    })
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+
+    const account = bridge['accounts'][0]
+    // 绑定房间（approval 推送需要 roomId）
+    account['state'].setRoomSession('!room:hs.example', 'matrix-ai-bot-test')
+    const agent = { id: 'matrix-ai-bot-test', status: 'idle', session: { id: 'x', append() {}, deriveMessages() { return [] } }, followup() {} }
+    // 无人应答 → approval 超时（approvalTimeoutSecs=2）返回 unavailable（deny）。
+    const okPromise = account['approveProactiveSend']('matrix_send_dm', { roomId: '!room:hs.example' }, { agent, signal: new AbortController().signal })
+    // 应已发起审批（pendingApprovals 有记录）
+    await waitFor(() => account['pendingApprovals'].size > 0, 2000)
+    assert.ok(account['pendingApprovals'].size > 0, '应发起审批请求')
+    // 审批超时后返回 unavailable（deny）
+    const ok = await okPromise
+    assert.equal(ok, false, '无批准时应拒绝主动发送')
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// 入站图片：m.image 消息应触发媒体下载，并把保存路径注入 agent 文本。
+test('bridge: inbound m.image downloads media and injects saved path', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-media-test-'))
+  let bridge
+  try {
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx()
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example',
+      accessToken: 'token',
+      userId: USER_ID,
+      allowedUserIds: [SENDER],
+      allowAllUsers: false,
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000,
+      mergeTimeoutSecs: 1,
+      approvalTimeoutSecs: 60,
+      stateDir: dir,
+      fetchFn: hs.fetch,
+      sleep: async () => {},
+      respondToAll: true,
+      matrixTools: true,
+    })
+
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+
+    // 绑定房间 + cwd，使媒体保存到 cwd/.dsh-matrix/media（可断言路径）。
+    const account = bridge['accounts'][0]
+    account['state'].setRoomCwd(ROOM_ID, dir)
+
+    hs.deliver([imageEvent('$img1', 'mxc://hs.example/img1')])
+    await waitFor(() => captured.messages.length >= 1)
+    const msg = captured.messages[0]
+    const text = msg.content[0].text
+    assert.ok(text.includes('图片'), '应含媒体标签')
+    assert.ok(text.includes('photo.png'), '应含文件名')
+    assert.ok(text.includes('.dsh-matrix'), '应含保存路径')
+    // 断言文件真实写入
+    const savedDir = join(dir, '.dsh-matrix', 'media')
+    const files = await readdir(savedDir)
+    assert.ok(files.length >= 1, '媒体应落盘到 .dsh-matrix/media')
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// 入站图片 + ctx.attachments 可用：应把图片持久化为多模态附件，注入 image 内容块，
+// 使模型直接看见图片（避免依赖 read_image 这类未注册工具导致失败）。
+test('bridge: inbound m.image attaches vision block when attachments service present', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-vision-test-'))
+  let bridge
+  try {
+    const saved = []
+    const attachments = {
+      async saveImage({ data, mediaType, name }) {
+        saved.push({ size: data.length, mediaType, name })
+        return { attachmentId: `att-${saved.length}`, mediaType, bytes: data.length, width: 100, height: 100, name }
+      },
+    }
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx({ attachments })
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example',
+      accessToken: 'token',
+      userId: USER_ID,
+      allowedUserIds: [SENDER],
+      allowAllUsers: false,
+      provider: 'deepseek-official',
+      model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000,
+      mergeTimeoutSecs: 1,
+      approvalTimeoutSecs: 60,
+      stateDir: dir,
+      fetchFn: hs.fetch,
+      sleep: async () => {},
+      respondToAll: true,
+      matrixTools: true,
+    })
+
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+
+    hs.deliver([imageEvent('$img1', 'mxc://hs.example/img1')])
+    await waitFor(() => captured.messages.length >= 1)
+    const msg = captured.messages[0]
+    const imageBlock = msg.content.find((c) => c.type === 'image')
+    assert.ok(imageBlock, '应包含 image 多模态内容块')
+    assert.ok(imageBlock.attachment.attachmentId, 'image 块应含附件引用')
+    assert.equal(saved.length, 1, '应调用 saveImage 持久化图片')
+    assert.equal(saved[0].mediaType, 'image/png')
   } finally {
     if (bridge) await bridge.stop()
     await rm(dir, { recursive: true, force: true })
