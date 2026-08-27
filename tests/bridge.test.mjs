@@ -862,3 +862,101 @@ test('bridge: inbound m.image attaches vision block when attachments service pre
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+// 富文本：formatted_body 应被提取为结构注记注入 agent，纯文本仍保留。
+test('bridge: inbound rich text annotates structure while keeping plain text', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-richtext-test-'))
+  let bridge
+  try {
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx()
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example', accessToken: 'token', userId: USER_ID,
+      allowedUserIds: [SENDER], allowAllUsers: false, provider: 'deepseek-official', model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000, mergeTimeoutSecs: 1, approvalTimeoutSecs: 60, stateDir: dir,
+      fetchFn: hs.fetch, sleep: async () => {}, respondToAll: true, matrixTools: true,
+    })
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+    hs.deliver([{
+      type: 'm.room.message', sender: SENDER, event_id: '$rich1',
+      content: { msgtype: 'm.text', body: '看下链接和代码', format: 'org.matrix.custom.html', formatted_body: '<p>看下 <a href="https://x">链接</a> 和 <code>code</code></p>' },
+    }])
+    await waitFor(() => captured.messages.length >= 1)
+    const text = captured.messages[0].content[0].text
+    assert.ok(text.includes('看下链接和代码'), '纯文本仍保留')
+    assert.ok(text.includes('[富文本含: 链接/代码]'), '应注记富文本结构')
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// 回复引用：agent 应看到被回复的原消息内容（类人理解上下文）。
+test('bridge: inbound reply injects referenced original message', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-reply-test-'))
+  let bridge
+  try {
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx()
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example', accessToken: 'token', userId: USER_ID,
+      allowedUserIds: [SENDER], allowAllUsers: false, provider: 'deepseek-official', model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000, mergeTimeoutSecs: 1, approvalTimeoutSecs: 60, stateDir: dir,
+      fetchFn: hs.fetch, sleep: async () => {}, respondToAll: true, matrixTools: true,
+    })
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+    // 先来一条原消息，再来一条回复它。
+    hs.deliver([{ type: 'm.room.message', sender: SENDER, event_id: '$orig1', content: { msgtype: 'm.text', body: '请帮我查一下天气' } }])
+    await waitFor(() => captured.messages.length >= 1)
+    hs.deliver([{
+      type: 'm.room.message', sender: SENDER, event_id: '$rep1',
+      content: { msgtype: 'm.text', body: '好的收到', 'm.relates_to': { 'm.in_reply_to': { event_id: '$orig1' } } },
+    }])
+    await waitFor(() => captured.messages.length >= 2)
+    const text = captured.messages[1].content[0].text
+    assert.ok(text.includes('[回复 @alice 的消息: 请帮我查一下天气]'), '应注入被回复原消息上下文')
+    assert.ok(text.includes('好的收到'), '本消息正文仍保留')
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// 编辑消息：标记为编辑后最新版；preserveRichText=false 时回退纯文本。
+test('bridge: inbound edit marked + preserveRichText=false strips context', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-matrix-edit-test-'))
+  let bridge
+  try {
+    const hs = fakeHomeserver()
+    const { ctx, captured } = makeCtx()
+    bridge = new MatrixBridge(ctx, {
+      homeserverUrl: 'https://hs.example', accessToken: 'token', userId: USER_ID,
+      allowedUserIds: [SENDER], allowAllUsers: false, provider: 'deepseek-official', model: 'deepseek-v4-flash',
+      chunkMaxChars: 4000, mergeTimeoutSecs: 1, approvalTimeoutSecs: 60, stateDir: dir,
+      fetchFn: hs.fetch, sleep: async () => {}, respondToAll: true, matrixTools: true,
+      preserveRichText: false,
+    })
+    const startPromise = bridge.start()
+    hs.deliver([])
+    await startPromise
+    // 先来一条原消息，再来一条编辑它的消息。
+    hs.deliver([{ type: 'm.room.message', sender: SENDER, event_id: '$orig2', content: { msgtype: 'm.text', body: '第一版' } }])
+    await waitFor(() => captured.messages.length >= 1)
+    hs.deliver([{
+      type: 'm.room.message', sender: SENDER, event_id: '$edit2',
+      content: { msgtype: 'm.replace', body: '第二版', 'm.relates_to': { 'm.in_reply_to': { event_id: '$orig2' } }, 'm.new_content': { msgtype: 'm.text', body: '第二版' } },
+    }])
+    await waitFor(() => captured.messages.length >= 2)
+    const text = captured.messages[1].content[0].text
+    assert.ok(text.includes('第二版'), '用最新版内容')
+    assert.ok(!text.includes('[此消息是对其早前版本的编辑后最新版]'), 'preserveRichText=false 不注入编辑标记')
+    assert.ok(!text.includes('[回复'), 'preserveRichText=false 不注入回复上下文')
+  } finally {
+    if (bridge) await bridge.stop()
+    await rm(dir, { recursive: true, force: true })
+  }
+})

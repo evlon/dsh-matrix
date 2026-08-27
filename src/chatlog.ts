@@ -6,6 +6,10 @@ export interface ChatEntry {
   readonly ts: number
   readonly sender: string
   readonly text: string
+  /** 对应 Matrix 消息 event_id；用于编辑消息的替换去重。 */
+  readonly eventId?: string
+  /** 若为编辑消息，被替换的原 event_id（用于回溯展示最新版）。 */
+  readonly editTargetEventId?: string
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000
@@ -61,6 +65,26 @@ export class ChatLog {
     arr.push(entry)
     const cutoff = Date.now() - WEEK_MS
     // 保留最近一周 + 上限内的最旧部分（裁剪从头部删除）。
+    while (arr.length > 0) {
+      const head = arr[0]!
+      if (head.ts >= cutoff && arr.length <= ROOM_CAP) break
+      arr.shift()
+    }
+    this.flushRoom(roomId, arr)
+  }
+
+  /** 编辑消息：用新内容替换原有 eventId 的记录；找不到则追加。 */
+  replace(roomId: string, targetEventId: string, entry: ChatEntry): void {
+    this.ensureLoaded()
+    let arr = this.mem.get(roomId)
+    if (!arr) {
+      arr = []
+      this.mem.set(roomId, arr)
+    }
+    const idx = arr.findIndex((e) => e.eventId === targetEventId)
+    if (idx >= 0) arr[idx] = entry
+    else arr.push(entry)
+    const cutoff = Date.now() - WEEK_MS
     while (arr.length > 0) {
       const head = arr[0]!
       if (head.ts >= cutoff && arr.length <= ROOM_CAP) break

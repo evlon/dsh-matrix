@@ -97,6 +97,11 @@ export interface Config {
    * 默认 true（安全优先）。
    */
   proactiveSendRequiresApproval: boolean
+  /** 是否保留富文本（formatted_body）/回复上下文/编辑语义，结构化注入 agent 会话。
+   * true：注入富文本结构注记 + 被回复消息引用 + 编辑标记，类人理解信息不丢失。
+   * false：回退纯文本旧行为（token 更省、行为更保守）。默认 true。
+   */
+  preserveRichText: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -136,4 +141,5 @@ export const Config: Schema<Config> = Schema.object({
   matrixTools: Schema.boolean().default(true),
   notifyRoomEvents: Schema.boolean().default(false),
   proactiveSendRequiresApproval: Schema.boolean().default(true),
+  preserveRichText: Schema.boolean().default(true),
 })

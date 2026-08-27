@@ -93,6 +93,7 @@ src/
 
 - **Matrix → DSH**：白名单用户文本经合并窗口（`..` 继续 / `!!` 立即提交 / 裸文本进合并窗口）后，通过 `agent.followup` 注入对应房间的 agent 会话；`/bind <session-id>` 可切换到已有会话
 - **媒体处理（图片/文件/音视频/位置）**：入站非文本消息自动下载（`mxc://` → `/media/v3/download`），保存到房间工作区 `.dsh-matrix/media`（或 `stateDir/media`）并附上本地路径；**图片额外持久化为多模态 `image` 内容块**，让模型直接看见——即使模型不支持视觉，harness 也会优雅降级为文本占位而非报错（避免旧版 `read_image` 工具不存在导致的 `unknown tool` 失败）；位置消息带坐标
+- **信息完整（类人处理）**：`preserveRichText`（默认开）时入站消息信息不丢失——**图文混排**保留文字说明（caption，修复旧版丢 caption bug）、**富文本**（`formatted_body` 的链接/加粗/代码块/列表）注入结构注记、**回复引用**（`m.in_reply_to`）注入被回复原消息上下文、**编辑**（`m.replace`）标记为最新版并在聊天记录里去重替换；设为 `false` 回退纯文本旧行为
 - **9 个 Matrix 工具**（经 `ctx.tools.register` 注册，模型可见且可直接执行）：`matrix_get_room_members` / `matrix_get_recent_messages` / `matrix_get_room_info` / `matrix_get_user_info` / `matrix_send_room_message` / `matrix_send_dm` / `matrix_mention_member` / `matrix_list_rooms` / `matrix_get_media`（详情见下方「Matrix 工具」）
 - **主动消息**：agent 可主动私聊、向房间发消息、@成员（`matrix_send_dm`/`send_room_message`/`mention_member`）；首用经 Owner 审批记忆授权（`proactiveSendRequiresApproval`），或配置关闭直接允许
 - **房间事件**：入群/离群/邀请/改名换头像/房间名/主题变化经 `onRoomEvent` 投影，`notifyRoomEvents` 开启后注入 agent 会话（供主动打招呼等）
@@ -178,6 +179,7 @@ allowBuilds:
 | `matrixTools` | `true` | 是否注册 9 个 Matrix 工具（成员/消息/房间/用户查询、主动发送、媒体下载） |
 | `notifyRoomEvents` | `false` | 是否把入群/离群/资料变更等房间事件注入 agent 会话（供主动打招呼等） |
 | `proactiveSendRequiresApproval` | `true` | 主动消息工具（`matrix_send_dm`/`send_room_message`/`mention_member`）首用是否需 Owner 批准 |
+| `preserveRichText` | `true` | 是否保留富文本（`formatted_body`）/回复上下文/编辑语义，结构化注入 agent（类人信息完整）；`false` 回退纯文本 |
 
 ### 配置示例
 

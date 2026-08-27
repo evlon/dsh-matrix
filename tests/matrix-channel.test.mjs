@@ -253,3 +253,88 @@ test('inbound media: m.image 消息归一为 MediaBlock（含 filename/w/h/mxc�
   assert.equal(m.mimetype, 'image/png')
   assert.equal(msg.text, '', '纯媒体消息 text 应为空')
 })
+
+test('inbound media: 图文混排 m.image 保留 caption 文字说明（不丢失）', async () => {
+  const messages = []
+  const { fetchFn } = mockFetch(({ path }) => {
+    if (path.endsWith('/sync')) {
+      return { next_batch: 's1', rooms: { join: { [ROOM]: { timeline: { events: [
+        { type: 'm.room.message', sender: '@alice:hs.example', event_id: '$img2', origin_server_ts: 100, content: { msgtype: 'm.image', body: '这是报告截图', filename: 'report.png', url: 'mxc://hs.example/img2', info: { mimetype: 'image/png', size: 10, w: 800, h: 600 } } },
+      ] } } } } }
+    }
+    return undefined
+  })
+  const ch = new MatrixChannel({
+    homeserverUrl: HS, accessToken: TOKEN, userId: BOT, state: makeState(), fetchFn, onMessage: (m) => messages.push(m),
+  })
+  await ch.start()
+  await ch.stop()
+  assert.equal(messages.length, 1)
+  const msg = messages[0]
+  assert.equal(msg.text, '这是报告截图', '图文混排的 caption 应保留在 text，不丢失')
+  assert.equal(msg.media.length, 1)
+  assert.equal(msg.media[0].caption, '这是报告截图', 'MediaBlock 应带 caption')
+})
+
+test('inbound rich text: m.text 的 formatted_body 被捕获为 formattedHtml', async () => {
+  const messages = []
+  const { fetchFn } = mockFetch(({ path }) => {
+    if (path.endsWith('/sync')) {
+      return { next_batch: 's1', rooms: { join: { [ROOM]: { timeline: { events: [
+        { type: 'm.room.message', sender: '@alice:hs.example', event_id: '$rich1', origin_server_ts: 100, content: { msgtype: 'm.text', body: '看下 https://x.example 这个链接', format: 'org.matrix.custom.html', formatted_body: '<p>看下 <a href="https://x.example">链接</a> 这个链接</p>' } },
+      ] } } } } }
+    }
+    return undefined
+  })
+  const ch = new MatrixChannel({
+    homeserverUrl: HS, accessToken: TOKEN, userId: BOT, state: makeState(), fetchFn, onMessage: (m) => messages.push(m),
+  })
+  await ch.start()
+  await ch.stop()
+  assert.equal(messages.length, 1)
+  const msg = messages[0]
+  assert.equal(msg.formattedHtml, '<p>看下 <a href="https://x.example">链接</a> 这个链接</p>', '应捕获 formatted_body')
+  assert.equal(msg.text, '看下 https://x.example 这个链接', '纯文本仍保留')
+})
+
+test('inbound reply: m.relates_to.m.in_reply_to 解析为 replyToEventId', async () => {
+  const messages = []
+  const { fetchFn } = mockFetch(({ path }) => {
+    if (path.endsWith('/sync')) {
+      return { next_batch: 's1', rooms: { join: { [ROOM]: { timeline: { events: [
+        { type: 'm.room.message', sender: '@alice:hs.example', event_id: '$rep1', origin_server_ts: 100, content: { msgtype: 'm.text', body: '好的，收到', 'm.relates_to': { 'm.in_reply_to': { event_id: '$orig1' } } } },
+      ] } } } } }
+    }
+    return undefined
+  })
+  const ch = new MatrixChannel({
+    homeserverUrl: HS, accessToken: TOKEN, userId: BOT, state: makeState(), fetchFn, onMessage: (m) => messages.push(m),
+  })
+  await ch.start()
+  await ch.stop()
+  assert.equal(messages.length, 1)
+  const msg = messages[0]
+  assert.equal(msg.replyToEventId, '$orig1', '应解析出被回复的原 event_id')
+})
+
+test('inbound edit: m.replace 用 m.new_content 覆盖，标记 isEdit 与 editTargetEventId', async () => {
+  const messages = []
+  const { fetchFn } = mockFetch(({ path }) => {
+    if (path.endsWith('/sync')) {
+      return { next_batch: 's1', rooms: { join: { [ROOM]: { timeline: { events: [
+        { type: 'm.room.message', sender: '@alice:hs.example', event_id: '$edit2', origin_server_ts: 100, content: { msgtype: 'm.replace', body: 'v2 版本文字', 'm.relates_to': { 'm.in_reply_to': { event_id: '$orig2' } }, 'm.new_content': { msgtype: 'm.text', body: 'v2 版本文字' } } },
+      ] } } } } }
+    }
+    return undefined
+  })
+  const ch = new MatrixChannel({
+    homeserverUrl: HS, accessToken: TOKEN, userId: BOT, state: makeState(), fetchFn, onMessage: (m) => messages.push(m),
+  })
+  await ch.start()
+  await ch.stop()
+  assert.equal(messages.length, 1)
+  const msg = messages[0]
+  assert.equal(msg.isEdit, true, '应标记为编辑消息')
+  assert.equal(msg.editTargetEventId, '$orig2', '应解析出被编辑的原 event_id')
+  assert.equal(msg.text, 'v2 版本文字', '应用 m.new_content 的最新内容')
+})

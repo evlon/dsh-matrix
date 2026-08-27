@@ -266,6 +266,13 @@ export class AccountBridge {
   /** 并发单飞锁：避免同一 roomId 的消息同时进入 getRoomAgent 时重复创建会话。 */
   private readonly roomAgentInflight = new Map<string, Promise<Agent>>()
   private readonly mergeBuffers = new Map<string, MergeBuffer>()
+  /**
+   * 近期消息 eventId → {sender, text} 缓存（按房间），用于解析回复引用（m.in_reply_to）
+   * 与编辑替换。有界（每房间保留最近 N 条），供 handleMessage 类人注入上下文。
+   */
+  private readonly recentByEvent = new Map<string, Map<string, { sender: string; text: string }>>()
+  /** 每房间 recentByEvent 保留上限（防止无限增长）。 */
+  private readonly recentEventCap = 200
   /** 已注入的房间事件 eventId 去重（防 sync 重放重复触发）。 */
   private readonly seenRoomEventIds = new Set<string>()
   /** 房间事件合并窗口（多人同批 join/leave 合并成一条注入）。 */
@@ -893,6 +900,55 @@ export class AccountBridge {
     return await attachments.saveImage({ data, mediaType, name })
   }
 
+  /**
+   * 类人上下文注入：把一条消息的回复引用 / 编辑标记 / 富文本结构补成可读文本，
+   * 使 agent 像人一样理解"这条消息是在回复谁、是编辑后的最新版、含哪些富文本结构"。
+   * 仅在 preserveRichText=true 时调用；返回已增强的文本。
+   * 富文本保守策略：纯文本仍是主内容，富文本只做简短的结构注记，避免 token 失控。
+   */
+  private buildMessageContext(message: InboundMessage, baseText: string): string {
+    const parts: string[] = []
+    // 回复引用：把被回复的原消息文本作为前缀，模拟"人看到你在回复某某"。
+    if (message.replyToEventId !== undefined) {
+      const quoted = this.recentByEvent.get(message.roomId)?.get(message.replyToEventId)
+      if (quoted !== undefined) {
+        parts.push(`[回复 @${localpartOf(quoted.sender)} 的消息: ${quoted.text}]`)
+      } else {
+        parts.push('[回复了一条消息]')
+      }
+    }
+    // 编辑标记：标注这是某条消息的编辑后最新版。
+    if (message.isEdit) {
+      parts.push(message.editTargetEventId !== undefined
+        ? '[此消息是对其早前版本的编辑后最新版]'
+        : '[此消息已编辑]')
+    }
+    // 富文本结构注记：保留链接/加粗/代码块/列表语义，供模型理解格式（不替换纯文本）。
+    if (message.formattedHtml !== undefined) {
+      const structure = this.richTextSummary(message.formattedHtml)
+      if (structure !== '') parts.push(`[富文本含: ${structure}]`)
+    }
+    if (parts.length === 0) return baseText
+    return `${parts.join(' ')}\n${baseText}`
+  }
+
+  /**
+   * 从 Matrix HTML（formatted_body）里提取简短的结构注记（有链接/加粗/代码块/列表/标题时说明），
+   * 供模型理解格式语义。不做完整渲染，仅保留"有哪些结构"这一层信息。
+   */
+  private richTextSummary(html: string): string {
+    const tags: string[] = []
+    if (/<a\b/i.test(html)) tags.push('链接')
+    if (/<strong\b|<b\b/i.test(html)) tags.push('加粗')
+    if (/<em\b|<i\b/i.test(html)) tags.push('斜体')
+    if (/<code\b|<pre\b/i.test(html)) tags.push('代码')
+    if (/<ul\b|<ol\b|<li\b/i.test(html)) tags.push('列表')
+    if (/<h[1-6]\b/i.test(html)) tags.push('标题')
+    if (/<blockquote\b/i.test(html)) tags.push('引用块')
+    if (tags.length === 0) return ''
+    return tags.join('/')
+  }
+
   private async handleMessage(message: InboundMessage): Promise<void> {
     try {
       // 入站归一化：把文本与媒体占位合并成一条 message.text。
@@ -900,7 +956,25 @@ export class AccountBridge {
       // 图片额外持久化为多模态附件（imageRefs），使模型直接看见图片。
       // 下载失败则退化为占位文本，不静默丢弃，避免用户发图后 agent 无响应。
       const { text: mediaText, imageRefs } = await this.describeMedia(message.roomId, message.media)
-      const text = (message.text + mediaText).trim()
+      let text = (message.text + mediaText).trim()
+
+      // 类人上下文：回复引用 / 编辑标记 / 富文本结构注记（受 preserveRichText 门控）。
+      // 先把本条消息写入近期缓存，供后续回复引用解析。
+      if (text !== '' && message.eventId !== '') {
+        const roomRecent = this.recentByEvent.get(message.roomId) ?? new Map<string, { sender: string; text: string }>()
+        roomRecent.set(message.eventId, { sender: message.sender, text })
+        // 有界：超出上限丢弃最旧。
+        if (roomRecent.size > this.recentEventCap) {
+          const oldest = roomRecent.keys().next().value
+          if (oldest !== undefined) roomRecent.delete(oldest)
+        }
+        this.recentByEvent.set(message.roomId, roomRecent)
+      }
+      // 类人上下文：回复引用 / 编辑标记 / 富文本结构注记（受 preserveRichText 门控）。
+      // 默认开启（undefined 视同 true）；显式设为 false 时回退纯文本。
+      if (this.config.preserveRichText !== false) {
+        text = this.buildMessageContext(message, text)
+      }
       if (text === '') return
 
       // 剥离「已知账号」的 @提及 前缀后再判定命令/审批词（如 '@ai-dev /auth list'）。
@@ -980,8 +1054,15 @@ export class AccountBridge {
 
       this.diag.log(`handleMessage room=${message.roomId} from=${message.sender} digitalTwinMode=${this.config.digitalTwinMode} text=${text.slice(0, 60).replace(/\n/g, ' ')}`)
       // 记录近期聊天（与响应门控解耦：无论是否 @都存，供被人 @ 时回溯上下文）。
+      // 编辑消息用新内容替换原 eventId 记录，避免任务面板与回溯上下文出现重复旧版。
       if (text.trim().length > 0) {
-        this.chatlog.append(message.roomId, { ts: Date.now(), sender: message.sender, text })
+        if (message.isEdit && message.editTargetEventId !== undefined) {
+          this.chatlog.replace(message.roomId, message.editTargetEventId, {
+            ts: Date.now(), sender: message.sender, text, eventId: message.eventId, editTargetEventId: message.editTargetEventId,
+          })
+        } else {
+          this.chatlog.append(message.roomId, { ts: Date.now(), sender: message.sender, text, eventId: message.eventId })
+        }
       }
       if (!(await this.shouldRespond(message))) return
 

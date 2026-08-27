@@ -35,16 +35,30 @@ export interface MediaBlock {
   readonly localPath?: string
   /** m.location 的 geo_uri（地理坐标）。 */
   readonly geoUri?: string
+  /** 图注/说明（媒体消息的 content.body，若它不同于文件名则视为 caption）。 */
+  readonly caption?: string
 }
 
 export interface InboundMessage {
   readonly roomId: string
   readonly sender: string
-  /** 文本正文（m.text / m.notice 等）；纯媒体消息时为空串。 */
+  /** 文本正文（m.text / m.notice 等）；纯媒体消息时为空串，图文混排时保留 caption。 */
   readonly text: string
-  /** 非文字附件（图片/文件/音视频/位置）；本轮仅占位，不解析内容。 */
+  /** 非文字附件（图片/文件/音视频/位置）。 */
   readonly media: MediaBlock[]
   readonly eventId: string
+  /** 富文本正文（formatted_body，org.matrix.custom.html）；存在时保留供结构化理解。 */
+  readonly formattedHtml?: string
+  /** 被回复的原消息 event_id（m.relates_to.m.in_reply_to.event_id）。 */
+  readonly replyToEventId?: string
+  /** 所属线程根 event_id（m.relates_to.m.thread.event_id）。 */
+  readonly threadEventId?: string
+  /** 是否为编辑消息（m.replace，content 里含 m.new_content）。 */
+  readonly isEdit?: boolean
+  /** 若为编辑，被替换的原消息 event_id。 */
+  readonly editTargetEventId?: string
+  /** 是否为 m.emote（动作/表情文本）。 */
+  readonly isEmote?: boolean
 }
 
 /** 群/房间成员变化与资料变更事件（入群/离群/邀请/改名换头像/房间信息）。
@@ -159,6 +173,8 @@ interface MatrixEventJson {
   content?: {
     msgtype?: string
     body?: string
+    format?: string
+    formatted_body?: string
     url?: string
     mimetype?: string
     /** m.file 的原始文件名。 */
@@ -167,6 +183,19 @@ interface MatrixEventJson {
     info?: { mimetype?: string; size?: number; w?: number; h?: number; filename?: string }
     /** m.location 的地理坐标。 */
     geo_uri?: string
+    /** 回复/线程/编辑关系（m.relates_to）。 */
+    'm.relates_to'?: {
+      'm.in_reply_to'?: { event_id?: string }
+      'm.thread'?: { event_id?: string }
+    }
+    /** 编辑消息：m.replace 的新内容（m.new_content 内的 body/formatted_body 等）。 */
+    'm.new_content'?: {
+      body?: string
+      format?: string
+      formatted_body?: string
+      msgtype?: string
+      url?: string
+    }
     /** m.room.member 的成员状态（join/invite/leave/ban）。 */
     membership?: string
     /** m.room.member 携带的显示名/头像（资料变更）。 */
@@ -418,8 +447,8 @@ export class MatrixChannel implements Channel {
     this.options.state.markSeen(eventId)
     if (!(this.options.isAllowed?.(sender) ?? true)) return
 
-    // 非文字消息（图片/文件/音视频/位置）：归一成 media，text 留空。
-    // 本轮只识别结构、生成占位文本；内容下载/解析（OCR/多模态）由桥接层/工具完成。
+    // 非文字消息（图片/文件/音视频/位置）：归一成 media，同时保留正文作为 caption，
+    // 避免"图文混排"消息（文字 + 图片）的文字说明丢失。内容下载/解析由桥接层/工具完成。
     const MEDIA_MSGTYPES = new Set(['m.image', 'm.file', 'm.audio', 'm.video', 'm.location'])
     let text = content.body
     let media: MediaBlock[] = []
@@ -427,6 +456,9 @@ export class MatrixChannel implements Channel {
       const isLocation = msgtype === 'm.location'
       // Matrix 中 m.image/m.file 等的 content.url 即 mxc:// URI，url 与 mxc 同源。
       const mxc = isLocation ? undefined : (content.url?.startsWith('mxc://') ? content.url : undefined)
+      const filename = content.filename ?? content.info?.filename
+      // caption = 正文（仅当存在独立 filename 且正文与文件名不同，说明是用户写的说明而非占位文件名）。
+      const caption = filename !== undefined && content.body !== filename ? content.body : undefined
       media = [{
         msgtype,
         body: content.body,
@@ -434,19 +466,62 @@ export class MatrixChannel implements Channel {
         url: content.url,
         mxc,
         size: content.info?.size,
-        filename: content.filename ?? content.info?.filename,
+        filename,
         width: content.info?.w,
         height: content.info?.h,
         geoUri: content.geo_uri,
+        ...(caption !== undefined ? { caption } : {}),
       }]
-      // 文字型 msgtype（m.text/m.notice）仍作为 text 透传；媒体消息 text 置空。
-      if (msgtype === 'm.text' || msgtype === 'm.notice') {
-        // 保持 text
-      } else {
+      // 图文混排：文字型（m.text/m.notice）正文作为 text 透传；媒体消息的正文作为 caption 保留在 text，
+      // 以便 agent 既看见文字说明又能看见媒体。纯媒体（body 即文件名、无 caption）text 为空串。
+      if (msgtype !== 'm.text' && msgtype !== 'm.notice' && caption === undefined) {
         text = ''
       }
     }
-    this.options.onMessage?.({ roomId, sender, text, media, eventId })
+
+    // 关系信息：回复 / 线程 / 编辑。
+    const relatesTo = content['m.relates_to']
+    const replyToEventId = relatesTo?.['m.in_reply_to']?.event_id
+    const threadEventId = relatesTo?.['m.thread']?.event_id
+    // 编辑消息（m.replace）：用 m.new_content 覆盖正文与媒体。
+    const isEdit = msgtype === 'm.replace'
+    const newContent = content['m.new_content']
+    let effectiveText = text
+    let effectiveMedia = media
+    if (isEdit && newContent !== undefined) {
+      effectiveText = newContent.body ?? text
+      if (newContent.body !== undefined && MEDIA_MSGTYPES.has(newContent.msgtype ?? msgtype)) {
+        // 编辑后的媒体内容（一般只更新 body/url）。
+        const nc = newContent
+        const isLoc = (nc.msgtype ?? msgtype) === 'm.location'
+        const ncMxc = isLoc ? undefined : (nc.url?.startsWith('mxc://') ? nc.url : undefined)
+        effectiveMedia = [{
+          msgtype: nc.msgtype ?? msgtype,
+          body: nc.body ?? text,
+          mimetype: content.mimetype ?? content.info?.mimetype,
+          url: nc.url,
+          mxc: ncMxc,
+          size: content.info?.size,
+          filename: content.filename ?? content.info?.filename,
+          ...(nc.formatted_body !== undefined ? { caption: nc.body ?? text } : {}),
+        }]
+      }
+    }
+    const formattedHtml = content.formatted_body ?? newContent?.formatted_body
+    const isEmote = msgtype === 'm.emote'
+
+    this.options.onMessage?.({
+      roomId,
+      sender,
+      text: effectiveText,
+      media: effectiveMedia,
+      eventId,
+      ...(formattedHtml !== undefined ? { formattedHtml } : {}),
+      ...(replyToEventId !== undefined ? { replyToEventId } : {}),
+      ...(threadEventId !== undefined ? { threadEventId } : {}),
+      ...(isEdit ? { isEdit: true, ...(relatesTo?.['m.in_reply_to']?.event_id !== undefined ? { editTargetEventId: relatesTo['m.in_reply_to'].event_id } : {}) } : {}),
+      ...(isEmote ? { isEmote: true } : {}),
+    })
   }
 
   async sendText(roomId: string, plain: string, html?: string): Promise<void> {
